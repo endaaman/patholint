@@ -11,6 +11,8 @@ from pydantic import BaseModel
 
 from patholint.models import Report
 
+PROJ_ROOT = Path(__file__).resolve().parent.parent
+
 
 def serialize_value(val):
     if pd.isna(val):
@@ -22,6 +24,13 @@ def serialize_value(val):
     if isinstance(val, (np.floating,)):
         return float(val)
     return val
+
+
+def load_prompt(name: str) -> str:
+    path = PROJ_ROOT / "prompts" / f"{name}.md"
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt not found: {path}")
+    return path.read_text().strip()
 
 
 PRIVATE_COLS = {"フリガナ", "氏名", "生年月日"}
@@ -110,22 +119,14 @@ class CLI(AutoCLI):
             print(f"{r.病理番号}: {r.氏名} ({r.臨床診断})")
         print(f"\n{len(reports)} reports loaded")
 
-    VALIDATE_PROMPT = """\
-以下の病理報告書を検証してください。
-問題点があれば、1行に1つずつ、以下の形式で出力してください。
-
-[RuleViolation] 具体的な問題の説明
-[Inconsistency] 具体的な問題の説明
-[Deficiency] 具体的な問題の説明
-
-問題がなければ「問題なし」とだけ出力してください。"""
-
     class ValidateArgs(BaseModel):
         dir: str = param("data/reports", s="-d", l="--dir")
-        outdir: str = param("data/results", s="-o", l="--outdir")
+        outdir: str = param("out/results", s="-o", l="--outdir")
         model: str = param("sonnet", s="-m", l="--model")
+        prompt: str = param("zeroshot", s="-p", l="--prompt")
 
     def run_validate(self, a: ValidateArgs):
+        system_prompt = load_prompt(a.prompt)
         reports = Report.load_dir(a.dir)
         out = Path(a.outdir) / a.model
         out.mkdir(parents=True, exist_ok=True)
@@ -136,8 +137,8 @@ class CLI(AutoCLI):
                 print(f"[{i+1}/{len(reports)}] {r.病理番号}: skip (exists)")
                 continue
 
-            body = Path(a.dir) / f"{r.病理番号}.md"
-            prompt = self.VALIDATE_PROMPT + "\n\n" + body.read_text()
+            body = (Path(a.dir) / f"{r.病理番号}.md").read_text()
+            prompt = system_prompt + "\n\n" + body
 
             print(f"[{i+1}/{len(reports)}] {r.病理番号}: validating...", end=" ", flush=True)
             env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
@@ -147,6 +148,41 @@ class CLI(AutoCLI):
                 capture_output=True,
                 text=True,
                 env=env,
+            )
+            if result.returncode != 0:
+                print(f"ERROR: {result.stderr.strip()}")
+                continue
+
+            out_path.write_text(result.stdout)
+            print("done")
+
+    class OllamaArgs(BaseModel):
+        dir: str = param("data/reports", s="-d", l="--dir")
+        outdir: str = param("out/results", s="-o", l="--outdir")
+        model: str = param("gemma3:27b", s="-m", l="--model")
+        prompt: str = param("zeroshot", s="-p", l="--prompt")
+
+    def run_ollama(self, a: OllamaArgs):
+        system_prompt = load_prompt(a.prompt)
+        reports = Report.load_dir(a.dir)
+        out = Path(a.outdir) / a.model.replace(":", "_")
+        out.mkdir(parents=True, exist_ok=True)
+
+        for i, r in enumerate(reports):
+            out_path = out / f"{r.病理番号}.md"
+            if out_path.exists():
+                print(f"[{i+1}/{len(reports)}] {r.病理番号}: skip (exists)")
+                continue
+
+            body = (Path(a.dir) / f"{r.病理番号}.md").read_text()
+            prompt = system_prompt + "\n\n" + body
+
+            print(f"[{i+1}/{len(reports)}] {r.病理番号}: validating ({a.model})...", end=" ", flush=True)
+            result = subprocess.run(
+                ["ollama", "run", a.model],
+                input=prompt,
+                capture_output=True,
+                text=True,
             )
             if result.returncode != 0:
                 print(f"ERROR: {result.stderr.strip()}")
