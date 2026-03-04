@@ -1,5 +1,5 @@
 def main():
-    print("Hello from validate-pathology-diagnosis!")
+    print("Hello from patholint!")
 
 
 if __name__ == "__main__":

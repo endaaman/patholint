@@ -9,7 +9,7 @@ import yaml
 from pydantic_autocli import AutoCLI, param
 from pydantic import BaseModel
 
-from vpd.models import Report
+from patholint.models import Report
 
 
 def serialize_value(val):

@@ -1,7 +1,7 @@
 [project]
-name = "validate-pathology-diagnosis"
+name = "patholint"
 version = "0.1.0"
-description = "Add your description here"
+description = "LLM-based pathology report validation system"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,7 +17,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["vpd"]
+packages = ["patholint"]
 
 [project.scripts]
-vpd = "vpd.cli:main"
+patholint = "patholint.cli:main"
