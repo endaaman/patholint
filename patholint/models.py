@@ -36,8 +36,8 @@ class Report(BaseModel):
         meta = yaml.safe_load(parts[1]) or {}
         body = parts[2].strip()
 
-        # <所見>...</所見> と <診断>...</診断> をパース
-        for tag, key in [("所見", "病理組織所見"), ("診断", "病理組織診断")]:
+        # <findings>...</findings> と <diagnosis>...</diagnosis> をパース
+        for tag, key in [("findings", "病理組織所見"), ("diagnosis", "病理組織診断")]:
             m = re.search(rf"<{tag}>\n?(.*?)\n?</{tag}>", body, re.DOTALL)
             meta[key] = m.group(1).strip() if m else ""
 

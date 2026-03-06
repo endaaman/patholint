@@ -1,9 +1,11 @@
 import os
+import sys
 import subprocess
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import ollama
 import pandas as pd
 import yaml
 from pydantic_autocli import AutoCLI, param
@@ -31,6 +33,37 @@ def load_prompt(name: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Prompt not found: {path}")
     return path.read_text().strip()
+
+
+def resolve_report(report: str) -> Path:
+    """レポートIDまたはパスからファイルパスを解決"""
+    p = Path(report)
+    if p.exists():
+        return p
+    # IDとして data/reports/<id>.md を探す
+    p = PROJ_ROOT / "data" / "reports" / f"{report}.md"
+    if p.exists():
+        return p
+    raise FileNotFoundError(f"Report not found: {report}")
+
+
+def load_report_body(path: Path) -> str:
+    """レポートファイルから<findings>と<diagnosis>を抽出して返す"""
+    import re
+    text = path.read_text()
+    parts = []
+    for tag in ["findings", "diagnosis"]:
+        m = re.search(rf"(<{tag}>.*?</{tag}>)", text, re.DOTALL)
+        if m:
+            parts.append(m.group(1))
+    if not parts:
+        raise ValueError(f"<所見> or <診断> not found in {path}")
+    return "\n\n".join(parts)
+
+
+def estimate_tokens(text: str) -> int:
+    """日本語混在テキストのトークン数を雑に推定"""
+    return int(len(text) * 1.5)
 
 
 PRIVATE_COLS = {"フリガナ", "氏名", "生年月日"}
@@ -156,40 +189,73 @@ class CLI(AutoCLI):
             out_path.write_text(result.stdout)
             print("done")
 
-    class OllamaArgs(BaseModel):
-        dir: str = param("data/reports", s="-d", l="--dir")
+    class SingleArgs(BaseModel):
+        report: str = param(..., s="-r", l="--report", description="レポートID (例: 23-0845) またはファイルパス")
+        model: str = param("gpt-oss:20b", s="-m", l="--model")
+        ruleset: bool = param(False, l="--ruleset", description="ルールセット(kiyaku_crc)を含める")
         outdir: str = param("out/results", s="-o", l="--outdir")
-        model: str = param("gemma3:27b", s="-m", l="--model")
-        prompt: str = param("zeroshot", s="-p", l="--prompt")
+        temperature: float = param(0.3, s="-t", l="--temperature")
+        think: str = param("low", l="--think", description="thinking level: low/medium/high/false")
+        num_predict: int = param(4096, l="--num-predict")
 
-    def run_ollama(self, a: OllamaArgs):
-        system_prompt = load_prompt(a.prompt)
-        reports = Report.load_dir(a.dir)
-        out = Path(a.outdir) / a.model.replace(":", "_")
-        out.mkdir(parents=True, exist_ok=True)
+    def run_single(self, a: SingleArgs):
+        report_path = resolve_report(a.report)
+        report_id = report_path.stem
+        body = load_report_body(report_path)
 
-        for i, r in enumerate(reports):
-            out_path = out / f"{r.病理番号}.md"
-            if out_path.exists():
-                print(f"[{i+1}/{len(reports)}] {r.病理番号}: skip (exists)")
-                continue
+        # プロンプト組み立て
+        parts = [load_prompt("instruction")]
+        if a.ruleset:
+            ruleset_path = PROJ_ROOT / "data" / "kiyaku_crc_ruleset.md"
+            parts.append(ruleset_path.read_text().strip())
+        parts.append(body)
+        prompt = "\n\n".join(parts)
 
-            body = (Path(a.dir) / f"{r.病理番号}.md").read_text()
-            prompt = system_prompt + "\n\n" + body
+        # コンテキストサイズ自動計算
+        estimated = estimate_tokens(prompt)
+        num_ctx = estimated + a.num_predict + 2048
+        condition = "with_ruleset" if a.ruleset else "zeroshot"
 
-            print(f"[{i+1}/{len(reports)}] {r.病理番号}: validating ({a.model})...", end=" ", flush=True)
-            result = subprocess.run(
-                ["ollama", "run", a.model],
-                input=prompt,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                print(f"ERROR: {result.stderr.strip()}")
-                continue
+        print(f"Report: {report_id}", file=sys.stderr)
+        print(f"Model: {a.model}", file=sys.stderr)
+        print(f"Condition: {condition}", file=sys.stderr)
+        print(f"Context: {num_ctx} tokens (prompt ~{estimated})", file=sys.stderr)
+        print(f"Generating...", file=sys.stderr, flush=True)
 
-            out_path.write_text(result.stdout)
-            print("done")
+        res = ollama.chat(
+            model=a.model,
+            messages=[{"role": "user", "content": prompt}],
+            think=False if a.think == "false" else a.think,
+            options={
+                "temperature": a.temperature,
+                "num_ctx": num_ctx,
+                "num_predict": a.num_predict,
+                "repeat_penalty": 1.0,
+                "frequency_penalty": 0.3,
+            },
+        )
+
+        answer = (res.message.content or "").strip()
+        prompt_tokens = res.prompt_eval_count or 0
+        completion_tokens = res.eval_count or 0
+        duration = (res.total_duration or 0) / 1e9
+        thinking = (getattr(res.message, "thinking", None) or "").strip()
+
+        # 出力先: out/results/<condition>/<model>/<id>.md
+        model_dir = a.model.replace(":", "_")
+        out_dir = Path(a.outdir) / condition / model_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{report_id}.md"
+        out_path.write_text(answer + "\n")
+
+        if thinking:
+            print(f"Thinking: {len(thinking)} chars", file=sys.stderr)
+        print(f"Tokens: prompt={prompt_tokens}, completion={completion_tokens}", file=sys.stderr)
+        print(f"Duration: {duration:.1f}s", file=sys.stderr)
+        print(f"Output: {out_path}", file=sys.stderr)
+        if not answer:
+            print("WARNING: empty response (num_predict may be too low for thinking model)", file=sys.stderr)
+        print(answer)
 
 
 def main():
