@@ -493,6 +493,157 @@ class CLI(AutoCLI):
             print(f"  {name:25s} {loc:20s} {desc}")
 
 
+    class ScoreArgs(BaseModel):
+        model: str = param("all", s="-m", l="--model", description="モデル名 or 'all'")
+        condition: str = param("all", s="-c", l="--condition", description="zeroshot | ruleset | all")
+        resultdir: str = param("out/results", s="-d", l="--resultdir")
+        case: str = param("", s="-k", l="--case", description="特定の症例ID (例: 0001)")
+        dry_run: bool = param(False, l="--dry-run", description="対象ファイル一覧を表示するだけ")
+        force: bool = param(False, l="--force", description="既存スコアを上書き")
+
+    def run_score(self, a: ScoreArgs):
+        """claude -p で採点を実行"""
+        import re
+        import subprocess
+
+        scoring_models = [
+            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2",
+            "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
+        ]
+        models = scoring_models if a.model == "all" else [a.model]
+        conditions = CONDITIONS if a.condition == "all" else [a.condition]
+
+        prompt_text = load_prompt("scoring")
+
+        # 対象ファイル収集
+        targets = []
+        for cond in conditions:
+            for model in models:
+                model_dir = Path(a.resultdir) / cond / model
+                if not model_dir.exists():
+                    continue
+                if a.case:
+                    files = [model_dir / f"{a.case}.md"]
+                    files = [f for f in files if f.exists()]
+                else:
+                    files = sorted(model_dir.glob("[0-9]*.md"))
+
+                for fpath in files:
+                    text = fpath.read_text()
+                    if not a.force and "<score>" in text:
+                        continue
+                    targets.append(fpath)
+
+        if not targets:
+            print("No files to score (all already scored or no matches)")
+            return
+
+        if a.dry_run:
+            print(f"{len(targets)} files to score:")
+            for t in targets:
+                rel = t.relative_to(Path(a.resultdir))
+                print(f"  {rel}")
+            return
+
+        total = len(targets)
+        done = 0
+        errors = 0
+
+        for i, fpath in enumerate(targets):
+            rel = fpath.relative_to(Path(a.resultdir))
+            prefix = f"[{i+1}/{total}] {rel}"
+            print(f"{prefix}: ", end="", flush=True)
+
+            content = fpath.read_text()
+
+            # claude -p でスコアリング
+            try:
+                result = subprocess.run(
+                    ["claude", "-p", prompt_text, "--model", "sonnet"],
+                    input=content,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode != 0:
+                    print(f"ERROR (exit {result.returncode}): {result.stderr[:200]}")
+                    errors += 1
+                    continue
+            except subprocess.TimeoutExpired:
+                print("ERROR (timeout)")
+                errors += 1
+                continue
+            except FileNotFoundError:
+                print("ERROR: 'claude' command not found")
+                return False
+
+            output = result.stdout.strip()
+
+            # <note> と <score> を抽出
+            note_match = re.search(r"(<note>.*?</note>)", output, re.DOTALL)
+            score_match = re.search(r"(<score>.*?</score>)", output, re.DOTALL)
+
+            if not score_match:
+                print(f"ERROR: no <score> in output")
+                print(f"  Output: {output[:200]}")
+                errors += 1
+                continue
+
+            # 既存の <note>/<score> を除去（force時）
+            if a.force:
+                content = re.sub(r"\n*<note>.*?</note>", "", content, flags=re.DOTALL)
+                content = re.sub(r"\n*<score>.*?</score>", "", content, flags=re.DOTALL)
+                content = content.rstrip() + "\n"
+
+            # 追記
+            append_parts = []
+            if note_match:
+                append_parts.append(note_match.group(1))
+            append_parts.append(score_match.group(1))
+
+            content = content.rstrip() + "\n\n" + "\n\n".join(append_parts) + "\n"
+            fpath.write_text(content)
+
+            # score内容を表示
+            score_text = score_match.group(1)
+            detection = ""
+            det_m = re.search(r"detection:\s*(\S+)", score_text)
+            if det_m:
+                detection = det_m.group(1)
+            status_m = re.search(r"status:\s*(\S+)", score_text)
+            status = status_m.group(1) if status_m else "?"
+
+            done += 1
+            print(f"{status}/{detection}")
+
+        print(f"\nFinished: {done} scored, {errors} errors, {total - done - errors} skipped")
+
+    class ScoreStatusArgs(BaseModel):
+        resultdir: str = param("out/results", s="-d", l="--resultdir")
+
+    def run_score_status(self, a: ScoreStatusArgs):
+        """採点の進捗を表示"""
+        import re
+
+        scoring_models = [
+            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2",
+            "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
+        ]
+        for cond in CONDITIONS:
+            for model in scoring_models:
+                model_dir = Path(a.resultdir) / cond / model
+                if not model_dir.exists():
+                    continue
+                files = sorted(model_dir.glob("[0-9]*.md"))
+                scored = 0
+                for f in files:
+                    if "<score>" in f.read_text():
+                        scored += 1
+                total = len(files)
+                bar = f"{'█' * scored}{'░' * (total - scored)}" if total <= 50 else ""
+                print(f"  {cond}/{model}: {scored}/{total} {bar}")
+
+
 def main():
     cli = CLI()
     cli.run()

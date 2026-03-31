@@ -12,8 +12,10 @@ dependencies = [
     "pydantic-autocli>=0.3.2",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.3",
-    "yomitoku>=0.12.0",
 ]
+
+[project.optional-dependencies]
+ocr = ["yomitoku>=0.12.0"]
 
 [build-system]
 requires = ["hatchling"]
