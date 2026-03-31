@@ -100,6 +100,7 @@ def create_client() -> OpenAI:
     return OpenAI(
         base_url=f"http://{host}:4000/v1",
         api_key=key,
+        timeout=600,
     )
 
 
@@ -116,42 +117,50 @@ def build_messages(body: str, condition: str) -> list[dict]:
 
 
 def call_llm(client: OpenAI, model: str, messages: list[dict], temperature: float) -> dict:
-    """LLM呼び出しを実行し、結果を辞書で返す"""
+    """LLM呼び出しを実行し、結果を辞書で返す（streaming）"""
     t0 = time.time()
-    res = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=temperature,
         max_tokens=32768,
+        stream=True,
+        stream_options={"include_usage": True},
     )
-    duration = time.time() - t0
-    choice = res.choices[0]
-    answer = (choice.message.content or "").strip()
-    usage = res.usage
-    finish_reason = choice.finish_reason
 
-    # thinking/reasoning content の取得を試みる
-    raw_msg = choice.message.model_dump()
-    thinking = raw_msg.get("reasoning_content") or raw_msg.get("thinking") or ""
+    chunks = []
+    finish_reason = None
+    usage = None
+    for chunk in stream:
+        if chunk.usage:
+            usage = chunk.usage
+        if chunk.choices:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                chunks.append(delta.content)
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+
+    duration = time.time() - t0
+    answer = "".join(chunks).strip()
+
+    prompt_tokens = usage.prompt_tokens if usage else 0
+    completion_tokens = usage.completion_tokens if usage else 0
     thinking_tokens = None
     if usage:
         raw_usage = usage.model_dump()
         thinking_tokens = raw_usage.get("reasoning_tokens") or (raw_usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
 
     # 空応答デバッグ
-    if not answer and usage and usage.completion_tokens > 0:
-        print(f"WARNING: empty content despite {usage.completion_tokens} completion tokens", file=sys.stderr)
+    if not answer and completion_tokens > 0:
+        print(f"WARNING: empty content despite {completion_tokens} completion tokens", file=sys.stderr)
         print(f"  finish_reason: {finish_reason}", file=sys.stderr)
-        if thinking:
-            print(f"  thinking: {len(thinking)} chars", file=sys.stderr)
-        else:
-            print(f"  message fields: {[k for k, v in raw_msg.items() if v]}", file=sys.stderr)
 
     return {
         "answer": answer,
         "finish_reason": finish_reason,
-        "prompt_tokens": usage.prompt_tokens if usage else 0,
-        "completion_tokens": usage.completion_tokens if usage else 0,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
         "thinking_tokens": thinking_tokens,
         "duration_s": round(duration, 2),
     }
