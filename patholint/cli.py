@@ -19,18 +19,20 @@ load_dotenv()
 
 PROJ_ROOT = Path(__file__).resolve().parent.parent
 
-MODELS = [
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "gpt-oss-20b",
-    "gpt-oss-120b",
-    "sip-jmed-13b",
-    "sip-jmed-8x13b-q8",
-    "nemotron-3-nano",
-    "nemotron-3-super",
-    "qwen3.5-9b",
-    "qwen3.5-27b",
-]
+MODELS = {
+    # model_name: (host, port, description)
+    "claude-opus-4-6":    ("litellm", None, "Claude Opus 4.6"),
+    "claude-sonnet-4-6":  ("litellm", None, "Claude Sonnet 4.6"),
+    "deepseek-v3.2":      ("deepseek", 8000, "DeepSeek V3.2"),
+    "gpt-oss-20b":        ("litellm", None, "GPT-OSS 20B"),
+    "gpt-oss-120b":       ("litellm", None, "GPT-OSS 120B"),
+    "sip-jmed-13b":       ("litellm", None, "SIP-JMed 13B"),
+    "sip-jmed-8x13b-q8":  ("litellm", None, "SIP-JMed 8x13B Q8"),
+    "nemotron-3-nano":    ("litellm", None, "Nemotron-3 Nano"),
+    "nemotron-3-super":   ("litellm", None, "Nemotron-3 Super"),
+    "qwen3.5-9b":         ("litellm", None, "Qwen 3.5 9B"),
+    "qwen3.5-27b":        ("litellm", None, "Qwen 3.5 27B"),
+}
 
 CONDITIONS = ["zeroshot", "ruleset"]
 
@@ -93,15 +95,29 @@ def estimate_tokens(text: str) -> int:
     return int(len(text) * 1.5)
 
 
-def create_client() -> OpenAI:
-    """LiteLLMプロキシへのOpenAI clientを作成"""
-    host = os.environ.get("LITELLM_HOST", "prism-spark")
-    key = os.environ.get("LITELLM_MASTER_KEY", "")
-    return OpenAI(
-        base_url=f"http://{host}:4000/v1",
-        api_key=key,
-        timeout=600,
-    )
+def create_client(model: str) -> OpenAI:
+    """モデル名に応じたOpenAI clientを作成。"""
+    info = MODELS.get(model)
+    if not info:
+        raise ValueError(f"Unknown model: {model} (available: {', '.join(MODELS.keys())})")
+    host_key, port, _ = info
+    if host_key == "litellm":
+        host = os.environ.get("LITELLM_HOST", "prism-spark")
+        key = os.environ.get("LITELLM_MASTER_KEY", "")
+        return OpenAI(
+            base_url=f"http://{host}:4000/v1",
+            api_key=key,
+            timeout=600,
+        )
+    elif host_key == "deepseek":
+        host = os.environ.get("DEEPSEEK_HOST", "prism-llens")
+        return OpenAI(
+            base_url=f"http://{host}:{port}/v1",
+            api_key="none",
+            timeout=600,
+        )
+    else:
+        raise ValueError(f"Unknown host_key: {host_key}")
 
 
 def build_messages(body: str, condition: str) -> list[dict]:
@@ -330,7 +346,7 @@ class CLI(AutoCLI):
         print(f"Tokens (est): system ~{system_tokens}, user ~{user_tokens}")
         print(f"Generating...", flush=True)
 
-        client = create_client()
+        client = create_client(a.model)
         result = run_one(client, report_path, a.model, condition, a.outdir, a.temperature, a.force)
 
         if result is None:
@@ -361,7 +377,7 @@ class CLI(AutoCLI):
         dry_run: bool = param(False, l="--dry-run", description="API呼び出しせず件数とプロンプトサイズを表示")
 
     def run_batch(self, a: BatchArgs):
-        models = MODELS if a.model == "all" else [a.model]
+        models = list(MODELS.keys()) if a.model == "all" else [a.model]
         conditions = CONDITIONS if a.condition == "all" else [a.condition]
 
         # レポートファイル一覧
@@ -389,9 +405,8 @@ class CLI(AutoCLI):
             print(f"\nTotal: {len(report_files)} reports x {len(models)} models x {len(conditions)} conditions = {total} calls")
             return
 
-        client = create_client()
-
         for m in models:
+            client = create_client(m)
             for cond in conditions:
                 total = len(report_files)
                 skipped = 0
@@ -433,10 +448,11 @@ class CLI(AutoCLI):
         verbose: bool = param(False, s="-v", l="--verbose", description="生レスポンスを表示")
 
     def run_test(self, a: TestArgs):
-        """LiteLLM疎通テスト"""
-        client = create_client()
-        host = os.environ.get("LITELLM_HOST", "prism-spark")
-        print(f"Host: {host}:4000")
+        """疎通テスト"""
+        info = MODELS.get(a.model)
+        host_desc = f"{info[0]}:{info[1]}" if info else "unknown"
+        print(f"Host: {host_desc}")
+        client = create_client(a.model)
         print(f"Model: {a.model}")
         print(f"Sending test message...", flush=True)
 
@@ -472,8 +488,9 @@ class CLI(AutoCLI):
 
     def run_models(self, a: ModelsArgs):
         print("Available models:")
-        for m in MODELS:
-            print(f"  {m}")
+        for name, (host, port, desc) in MODELS.items():
+            loc = f"{host}:{port}" if port else host
+            print(f"  {name:25s} {loc:20s} {desc}")
 
 
 def main():
