@@ -5,6 +5,7 @@ description = "LLM-based pathology report validation system"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "matplotlib>=3.10.8",
     "numpy>=2.4.2",
     "openai>=1.0.0",
     "openpyxl>=3.1.5",
@@ -12,6 +13,7 @@ dependencies = [
     "pydantic-autocli>=0.3.2",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.3",
+    "seaborn>=0.13.2",
 ]
 
 [project.optional-dependencies]
