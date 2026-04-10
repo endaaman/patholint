@@ -1,4 +1,7 @@
+import json
+
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from pydantic import BaseModel
 from pydantic_autocli import AutoCLI, param
@@ -51,6 +54,7 @@ def savefig(fig, outdir: Path, name: str):
 class CLI(AutoCLI):
     class DefaultArgs(BaseModel):
         cases: str = param("out/cases.csv", s="-i", l="--cases", description="per-case CSV (tally --outdir で生成)")
+        resultdir: str = param("out/results", s="-r", l="--resultdir", description="results dir with _meta.jsonl")
         outdir: str = param("out/figs", s="-o", l="--outdir")
 
     def run_default(self, a: DefaultArgs):
@@ -73,6 +77,8 @@ class CLI(AutoCLI):
         self._plot_tp_exact_rate(df, outdir)
         self._plot_sensitivity_heatmap(df, outdir)
         self._plot_duration(df, outdir)
+        self._plot_case_heatmap(df, outdir)
+        self._plot_gpt_token_breakdown(Path(a.resultdir), outdir)
 
         print(f"\nAll figures saved to {outdir}/")
 
@@ -242,11 +248,12 @@ class CLI(AutoCLI):
             sub = fp_melt[fp_melt["condition"] == cond]
             fig, ax = plt.subplots(figsize=(9, 5))
             sns.barplot(data=sub, x="model", y="mean_count", hue="fp_type",
-                        palette={"fp_relevant": "#fdae61", "fp_spurious": "#d73027"}, ax=ax)
+                        palette={"fp_relevant": "#fdae61", "fp_spurious": "#d73027"}, saturation=1, ax=ax)
             ax.set_ylabel("Mean FP Count per Case")
             ax.set_xlabel("")
             ax.set_title(f"False Positives — {cond}")
-            ax.legend(title="FP Type", labels=["Relevant", "Spurious"])
+            handles, _ = ax.get_legend_handles_labels()
+            ax.legend(handles, ["Relevant", "Spurious"], title="FP Type")
             for c in ax.containers:
                 ax.bar_label(c, fmt="%.1f", fontsize=8, padding=2)
             savefig(fig, outdir, f"fp_comparison_{cond}")
@@ -339,6 +346,167 @@ class CLI(AutoCLI):
         ax.set_title("Response Time per Case")
         ax.legend(title="Condition")
         savefig(fig, outdir, "duration_boxplot")
+
+    # ============================================================
+    # 12. Case-level heatmap (gene expression style)
+    # ============================================================
+    def _plot_case_heatmap(self, df, outdir):
+        from matplotlib.colors import ListedColormap
+
+        det_val = {
+            "tp-exact": 2, "tp-content-only": 1,
+            "fn": -1, "fn-clean": -1,
+        }
+        df = df.copy()
+        df["det_val"] = df["detection"].map(det_val).fillna(-1)
+        df.loc[df["status"] == "error", "det_val"] = -2
+
+        # columns: model × condition
+        col_order = []
+        for m in SHORT_ORDER:
+            for c in CONDITIONS:
+                col_order.append(f"{m}\n{c}")
+
+        cases = sorted(df["case"].unique())
+        mat = np.full((len(cases), len(col_order)), np.nan)
+        for i, case in enumerate(cases):
+            for j, col in enumerate(col_order):
+                model, cond = col.split("\n")
+                row = df[(df["model"] == model) & (df["condition"] == cond) & (df["case"] == case)]
+                if len(row) == 1:
+                    mat[i, j] = row.iloc[0]["det_val"]
+
+        # tag labels for y-axis
+        case_tags = []
+        for case in cases:
+            tag = df[df["case"] == case]["gs_tag"].iloc[0]
+            case_tags.append(f"{case:04d} [{TAG_SHORT.get(tag, tag)}]")
+
+        cmap = ListedColormap(["#7f7f7f", "#d62728", "#98df8a", "#2ca02c"])
+        bounds = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5]
+
+        fig, ax = plt.subplots(figsize=(14, 16))
+        im = ax.imshow(mat, aspect="auto", cmap=cmap, vmin=-2.5, vmax=2.5, interpolation="nearest")
+        ax.set_xticks(range(len(col_order)))
+        ax.set_xticklabels(col_order, fontsize=8, rotation=45, ha="right")
+        ax.set_yticks(range(len(cases)))
+        ax.set_yticklabels(case_tags, fontsize=7, fontfamily="monospace")
+        ax.set_xlabel("")
+        ax.set_title("Per-Case Detection Results")
+
+        # vertical separators between models
+        for k in range(1, len(SHORT_ORDER)):
+            ax.axvline(k * 2 - 0.5, color="white", linewidth=1.5)
+
+        # legend
+        from matplotlib.patches import Patch
+        legend_items = [
+            Patch(color="#2ca02c", label="TP-Exact"),
+            Patch(color="#98df8a", label="TP-Content"),
+            Patch(color="#d62728", label="FN"),
+            Patch(color="#7f7f7f", label="Error"),
+        ]
+        ax.legend(handles=legend_items, loc="upper right", bbox_to_anchor=(1.15, 1))
+
+        savefig(fig, outdir, "case_heatmap")
+
+    # ============================================================
+    # 12. GPT-20B vs 120B token breakdown
+    # ============================================================
+    def _plot_gpt_token_breakdown(self, resultdir: Path, outdir):
+        import re as re2
+
+        models = ["gpt-oss-20b", "gpt-oss-120b"]
+        rows = []
+        for model in models:
+            for cond in CONDITIONS:
+                model_dir = resultdir / cond / model
+                if not model_dir.exists():
+                    continue
+                for fpath in sorted(model_dir.glob("[0-9]*.md")):
+                    text = fpath.read_text()
+                    cm = re2.search(r"completion_tokens:\s*(\d+)", text)
+                    comp = int(cm.group(1)) if cm else 0
+                    rows.append({
+                        "model": SHORT_NAMES[model],
+                        "condition": cond,
+                        "case": fpath.stem,
+                        "completion_tokens": comp,
+                    })
+        if not rows:
+            return
+
+        tok_df = pd.DataFrame(rows)
+        # cases.csv has correct duration
+        cases = pd.read_csv(resultdir.parent / "cases.csv")
+        cases["model"] = cases["model"].map(SHORT_NAMES).fillna(cases["model"])
+        cases["case"] = cases["case"].astype(str).str.zfill(4)
+        tok_df = tok_df.merge(
+            cases[["model", "condition", "case", "duration_s"]],
+            on=["model", "condition", "case"], how="left",
+        )
+        tok_df = tok_df[tok_df["model"].isin(["GPT-20B", "GPT-120B"])]
+        tok_df["tps"] = tok_df["completion_tokens"] / tok_df["duration_s"]
+
+        agg = tok_df.groupby(["model", "condition"]).agg(
+            tokens=("completion_tokens", "mean"),
+            duration=("duration_s", "mean"),
+            tps=("tps", "mean"),
+        ).reset_index()
+        # Sort: 120B first, then 20B; within each, zeroshot then ruleset
+        model_rank = {"GPT-120B": 0, "GPT-20B": 1}
+        cond_rank = {"zeroshot": 0, "ruleset": 1}
+        agg = agg.sort_values(
+            by=["model", "condition"],
+            key=lambda s: s.map(model_rank) if s.name == "model" else s.map(cond_rank),
+        ).reset_index(drop=True)
+
+        MODEL_PALETTE = {"GPT-120B": "#6baed6", "GPT-20B": "#fd8d3c"}
+        labels = [f"{r['model']}\n{r['condition']}" for _, r in agg.iterrows()]
+        x = np.arange(len(labels))
+        colors = [MODEL_PALETTE[r["model"]] for _, r in agg.iterrows()]
+
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(14, 5))
+
+        # 1: tok/s — スループットは同程度
+        bars_tps = ax1.bar(x, agg["tps"], color=colors)
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(labels, fontsize=9)
+        ax1.set_ylabel("Tokens / sec")
+        ax1.set_title("Throughput")
+        ax1.bar_label(bars_tps, fmt="%.0f", fontsize=9, padding=2)
+
+        # 2: output volume — 20Bは出力量が3-4倍
+        tok_std = tok_df.groupby(["model", "condition"])["completion_tokens"].std().reset_index()
+        tok_std = tok_std.sort_values(
+            by=["model", "condition"],
+            key=lambda s: s.map(model_rank) if s.name == "model" else s.map(cond_rank),
+        ).reset_index(drop=True)
+        bars_tok = ax2.bar(x, agg["tokens"], yerr=tok_std["completion_tokens"],
+                           capsize=4, color=colors, error_kw={"lw": 1.2})
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(labels, fontsize=9)
+        ax2.set_ylabel("Mean Output Tokens")
+        ax2.set_title("Output Volume")
+        ax2.bar_label(bars_tok, fmt="%.0f", fontsize=9, padding=3)
+
+        # 3: duration — 結果、処理時間が逆転
+        bars_dur = ax3.bar(x, agg["duration"], color=colors)
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(labels, fontsize=9)
+        ax3.set_ylabel("Mean Duration (s)")
+        ax3.set_title("Duration")
+        ax3.bar_label(bars_dur, fmt="%.0f", fontsize=9, padding=2)
+
+        # legend
+        from matplotlib.patches import Patch
+        handles = [Patch(color=c, label=m) for m, c in MODEL_PALETTE.items()]
+        ax3.legend(handles=handles, title="Model")
+
+        fig.suptitle("GPT-20B vs GPT-120B: Token Breakdown",
+                     fontsize=12, y=1.02)
+        fig.tight_layout()
+        savefig(fig, outdir, "gpt_token_breakdown")
 
 
 def main():
