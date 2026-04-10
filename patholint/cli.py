@@ -651,6 +651,7 @@ class CLI(AutoCLI):
         condition: str = param("all", s="-c", l="--condition", description="zeroshot | ruleset | all")
         by_tag: bool = param(False, l="--by-tag", description="GSタグ別の内訳を表示")
         csv: str = param("", l="--csv", description="CSV出力先パス")
+        outdir: str = param("", s="-o", l="--outdir", description="per-case CSV等の出力先 (例: out)")
 
     def run_tally(self, a: TallyArgs):
         """スコアを集計して表示"""
@@ -760,347 +761,50 @@ class CLI(AutoCLI):
             df.to_csv(a.csv, index=False)
             print(f"\nSaved to {a.csv}")
 
+        if a.outdir:
+            import re as re2
+            outdir = Path(a.outdir)
+            outdir.mkdir(parents=True, exist_ok=True)
 
-    class PlotArgs(BaseModel):
-        resultdir: str = param("out/results", s="-d", l="--resultdir")
-        reportdir: str = param("data/reports", s="-r", l="--reportdir")
-        outdir: str = param("out/figs", s="-o", l="--outdir")
-
-    def run_plot(self, a: PlotArgs):
-        """スコアからグラフを生成"""
-        import re
-
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-
-        sns.set_theme(style="whitegrid", font_scale=1.1)
-        plt.rcParams["figure.dpi"] = 150
-
-        outdir = Path(a.outdir)
-        outdir.mkdir(parents=True, exist_ok=True)
-
-        scoring_models = [
-            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2",
-            "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
-        ]
-        SHORT_NAMES = {
-            "claude-opus-4-6": "Opus",
-            "claude-sonnet-4-6": "Sonnet",
-            "deepseek-v3.2": "DeepSeek",
-            "gpt-oss-120b": "GPT-120B",
-            "gpt-oss-20b": "GPT-20B",
-            "sip-jmed-13b": "JMed-13B",
-        }
-        TAG_ORDER = ["RuleViolation", "Deficiency", "Inconsistency", "Typo"]
-        TAG_SHORT = {"RuleViolation": "RV", "Deficiency": "Def", "Inconsistency": "Inc", "Typo": "Typo"}
-
-        # --- データ収集 ---
-        gs_tags = {}
-        report_dir = Path(a.reportdir)
-        if report_dir.exists():
-            for rpath in report_dir.glob("*.md"):
-                text = rpath.read_text()
-                m = re.search(r"<gold_standard>\s*\[(\w+)\]", text)
-                if m:
-                    gs_tags[rpath.stem] = m.group(1)
-
-        records = []  # per-case records
-        for cond in CONDITIONS:
-            for model in scoring_models:
-                model_dir = Path(a.resultdir) / cond / model
-                if not model_dir.exists():
-                    continue
-                for fpath in sorted(model_dir.glob("[0-9]*.md")):
-                    text = fpath.read_text()
-                    sm = re.search(r"<score>(.*?)</score>", text, re.DOTALL)
-                    if not sm:
+            # per-case CSV (cases.csv)
+            case_records = []
+            for cond in conditions:
+                for model in models:
+                    model_dir = Path(a.resultdir) / cond / model
+                    if not model_dir.exists():
                         continue
-                    block = sm.group(1)
-                    entry = {
-                        "model": SHORT_NAMES.get(model, model),
-                        "condition": cond,
-                        "case": fpath.stem,
-                        "gs_tag": gs_tags.get(fpath.stem, ""),
-                    }
-                    for key in ["status", "detection"]:
-                        m = re.search(rf"{key}:\s*(\S+)", block)
-                        entry[key] = m.group(1) if m else ""
-                    for key in ["fp_relevant", "fp_spurious"]:
-                        m = re.search(rf"{key}:\s*(\d+)", block)
-                        entry[key] = int(m.group(1)) if m else 0
-                    # duration from frontmatter
-                    dm = re.search(r"duration_s:\s*([\d.]+)", text)
-                    entry["duration_s"] = float(dm.group(1)) if dm else None
-                    # derived
-                    det = entry["detection"]
-                    entry["tp"] = 1 if det in ("tp-exact", "tp-content-only") else 0
-                    entry["tp_exact"] = 1 if det == "tp-exact" else 0
-                    entry["tp_content"] = 1 if det == "tp-content-only" else 0
-                    entry["is_error"] = 1 if entry["status"] == "error" else 0
-                    records.append(entry)
+                    for fpath in sorted(model_dir.glob("[0-9]*.md")):
+                        text = fpath.read_text()
+                        sm = re2.search(r"<score>(.*?)</score>", text, re.DOTALL)
+                        if not sm:
+                            continue
+                        block = sm.group(1)
+                        entry = {"model": model, "condition": cond, "case": fpath.stem}
+                        for key in ["status", "detection"]:
+                            m = re2.search(rf"{key}:\s*(\S+)", block)
+                            entry[key] = m.group(1) if m else ""
+                        for key in ["fp_relevant", "fp_spurious"]:
+                            m = re2.search(rf"{key}:\s*(\d+)", block)
+                            entry[key] = int(m.group(1)) if m else 0
+                        dm = re2.search(r"duration_s:\s*([\d.]+)", text)
+                        entry["duration_s"] = float(dm.group(1)) if dm else None
+                        entry["gs_tag"] = gs_tags.get(fpath.stem, "")
+                        case_records.append(entry)
 
-        df = pd.DataFrame(records)
-        model_order = [SHORT_NAMES[m] for m in scoring_models]
-        df["model"] = pd.Categorical(df["model"], categories=model_order, ordered=True)
+            if case_records:
+                cases_df = pd.DataFrame(case_records)
+                cases_df.to_csv(outdir / "cases.csv", index=False)
+                print(f"Saved to {outdir}/cases.csv")
 
-        def savefig(fig, name):
-            path = outdir / f"{name}.png"
-            fig.savefig(path, bbox_inches="tight", facecolor="white")
-            plt.close(fig)
-            print(f"  {path}")
-
-        # ============================================================
-        # 1. Overall sensitivity (bar: model × condition)
-        # ============================================================
-        agg = df.groupby(["model", "condition"], observed=True)["tp"].mean().reset_index()
-        agg.rename(columns={"tp": "sensitivity"}, inplace=True)
-
-        fig, ax = plt.subplots(figsize=(10, 5))
-        sns.barplot(data=agg, x="model", y="sensitivity", hue="condition",
-                    palette={"zeroshot": "#7faadc", "ruleset": "#f4a582"}, ax=ax)
-        ax.set_ylabel("Sensitivity")
-        ax.set_xlabel("")
-        ax.set_ylim(0, 1.05)
-        ax.set_title("Overall Sensitivity by Model")
-        ax.legend(title="Condition")
-        for container in ax.containers:
-            ax.bar_label(container, fmt="%.2f", fontsize=8, padding=2)
-        savefig(fig, "overall_sensitivity")
-
-        # ============================================================
-        # 2. Sensitivity delta (ruleset - zeroshot)
-        # ============================================================
-        pivot = agg.pivot(index="model", columns="condition", values="sensitivity").reset_index()
-        pivot["delta"] = pivot["ruleset"] - pivot["zeroshot"]
-        pivot = pivot.sort_values("model", key=lambda s: s.map({m: i for i, m in enumerate(model_order)}))
-
-        fig, ax = plt.subplots(figsize=(8, 5))
-        colors = ["#4daf4a" if d >= 0 else "#e41a1c" for d in pivot["delta"]]
-        bars = ax.bar(pivot["model"], pivot["delta"], color=colors)
-        ax.axhline(0, color="black", linewidth=0.8)
-        ax.set_ylabel("Δ Sensitivity (ruleset − zeroshot)")
-        ax.set_xlabel("")
-        ax.set_title("Sensitivity Improvement with Ruleset")
-        ax.bar_label(bars, fmt="%+.2f", fontsize=9, padding=2)
-        savefig(fig, "overall_sensitivity_delta")
-
-        # ============================================================
-        # 3. Detection breakdown (stacked bar)
-        # ============================================================
-        det_map = {
-            "tp-exact": "TP-Exact",
-            "tp-content-only": "TP-Content",
-            "fn": "FN",
-            "fn-clean": "FN-Clean",
-        }
-        df["det_label"] = df["detection"].map(det_map).fillna("FN")
-        # error cases → override
-        df.loc[df["status"] == "error", "det_label"] = "Error"
-
-        det_order = ["TP-Exact", "TP-Content", "FN", "FN-Clean", "Error"]
-        det_colors = {"TP-Exact": "#2ca02c", "TP-Content": "#98df8a",
-                      "FN": "#d62728", "FN-Clean": "#ff9896", "Error": "#7f7f7f"}
-
-        for cond in CONDITIONS:
-            sub = df[df["condition"] == cond]
-            ct = sub.groupby(["model", "det_label"], observed=True).size().unstack(fill_value=0)
-            ct = ct.reindex(columns=[c for c in det_order if c in ct.columns], fill_value=0)
-
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ct.plot.bar(stacked=True, color=[det_colors[c] for c in ct.columns], ax=ax)
-            ax.set_ylabel("Count (n=50)")
-            ax.set_xlabel("")
-            ax.set_title(f"Detection Breakdown — {cond}")
-            ax.legend(title="Detection", bbox_to_anchor=(1.02, 1), loc="upper left")
-            ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
-            savefig(fig, f"detection_breakdown_{cond}")
-
-        # ============================================================
-        # 4. Sensitivity by tag (grouped bar, per condition)
-        # ============================================================
-        tag_df = df[df["gs_tag"].isin(TAG_ORDER)].copy()
-        tag_df["gs_tag"] = tag_df["gs_tag"].map(TAG_SHORT)
-        tag_short_order = [TAG_SHORT[t] for t in TAG_ORDER]
-        tag_df["gs_tag"] = pd.Categorical(tag_df["gs_tag"], categories=tag_short_order, ordered=True)
-
-        tag_agg = tag_df.groupby(["model", "condition", "gs_tag"], observed=True)["tp"].mean().reset_index()
-        tag_agg.rename(columns={"tp": "sensitivity"}, inplace=True)
-
-        for cond in CONDITIONS:
-            sub = tag_agg[tag_agg["condition"] == cond]
-            fig, ax = plt.subplots(figsize=(10, 5))
-            sns.barplot(data=sub, x="gs_tag", y="sensitivity", hue="model",
-                        palette="Set2", ax=ax)
-            ax.set_ylabel("Sensitivity")
-            ax.set_xlabel("Error Type")
-            ax.set_ylim(0, 1.15)
-            ax.set_title(f"Sensitivity by Error Type — {cond}")
-            ax.legend(title="Model", bbox_to_anchor=(1.02, 1), loc="upper left")
-            savefig(fig, f"sensitivity_by_tag_{cond}")
-
-        # ============================================================
-        # 5. Sensitivity by tag: zeroshot vs ruleset side-by-side per tag
-        # ============================================================
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4.5), sharey=True)
-        for i, tag in enumerate(TAG_ORDER):
-            ax = axes[i]
-            sub = tag_agg[tag_agg["gs_tag"] == TAG_SHORT[tag]]
-            sns.barplot(data=sub, x="model", y="sensitivity", hue="condition",
-                        palette={"zeroshot": "#7faadc", "ruleset": "#f4a582"}, ax=ax)
-            ax.set_title(TAG_SHORT[tag])
-            ax.set_ylim(0, 1.15)
-            ax.set_xlabel("")
-            ax.tick_params(axis="x", rotation=45)
-            for label in ax.get_xticklabels():
-                label.set_ha("right")
-            if i == 0:
-                ax.set_ylabel("Sensitivity")
-            else:
-                ax.set_ylabel("")
-            if i == 3:
-                ax.legend(title="Condition", bbox_to_anchor=(1.02, 1), loc="upper left")
-            else:
-                ax.get_legend().remove()
-        fig.suptitle("Sensitivity by Error Type: Zeroshot vs Ruleset", y=1.02)
-        fig.tight_layout()
-        savefig(fig, "sensitivity_by_tag_comparison")
-
-        # ============================================================
-        # 6. Sensitivity delta by tag (heatmap)
-        # ============================================================
-        tag_pivot = tag_agg.pivot_table(index="model", columns=["gs_tag", "condition"],
-                                        values="sensitivity")
-        delta_data = {}
-        for tag in tag_short_order:
-            if (tag, "ruleset") in tag_pivot.columns and (tag, "zeroshot") in tag_pivot.columns:
-                delta_data[tag] = tag_pivot[(tag, "ruleset")] - tag_pivot[(tag, "zeroshot")]
-        delta_df = pd.DataFrame(delta_data)
-        delta_df = delta_df.reindex(model_order)
-
-        fig, ax = plt.subplots(figsize=(7, 5))
-        sns.heatmap(delta_df, annot=True, fmt=".2f", cmap="RdYlGn", center=0,
-                    vmin=-0.3, vmax=0.6, linewidths=0.5, ax=ax)
-        ax.set_title("Δ Sensitivity (ruleset − zeroshot) by Error Type")
-        ax.set_ylabel("")
-        ax.set_xlabel("")
-        savefig(fig, "sensitivity_delta_heatmap")
-
-        # ============================================================
-        # 7. FP comparison (grouped bar)
-        # ============================================================
-        fp_agg = df.groupby(["model", "condition"], observed=True).agg(
-            fp_relevant=("fp_relevant", "mean"),
-            fp_spurious=("fp_spurious", "mean"),
-        ).reset_index()
-        fp_melt = fp_agg.melt(id_vars=["model", "condition"],
-                               value_vars=["fp_relevant", "fp_spurious"],
-                               var_name="fp_type", value_name="mean_count")
-
-        for cond in CONDITIONS:
-            sub = fp_melt[fp_melt["condition"] == cond]
-            fig, ax = plt.subplots(figsize=(9, 5))
-            sns.barplot(data=sub, x="model", y="mean_count", hue="fp_type",
-                        palette={"fp_relevant": "#fdae61", "fp_spurious": "#d73027"}, ax=ax)
-            ax.set_ylabel("Mean FP Count per Case")
-            ax.set_xlabel("")
-            ax.set_title(f"False Positives — {cond}")
-            ax.legend(title="FP Type", labels=["Relevant", "Spurious"])
-            for container in ax.containers:
-                ax.bar_label(container, fmt="%.1f", fontsize=8, padding=2)
-            savefig(fig, f"fp_comparison_{cond}")
-
-        # ============================================================
-        # 8. FP delta (ruleset - zeroshot)
-        # ============================================================
-        fp_pivot = fp_agg.pivot_table(index="model", columns="condition",
-                                       values=["fp_relevant", "fp_spurious"])
-        fp_delta = pd.DataFrame({
-            "FP-Relevant": fp_pivot[("fp_relevant", "ruleset")] - fp_pivot[("fp_relevant", "zeroshot")],
-            "FP-Spurious": fp_pivot[("fp_spurious", "ruleset")] - fp_pivot[("fp_spurious", "zeroshot")],
-        }).reindex(model_order)
-
-        fig, ax = plt.subplots(figsize=(9, 5))
-        x = range(len(fp_delta))
-        w = 0.35
-        bars1 = ax.bar([i - w/2 for i in x], fp_delta["FP-Relevant"], w,
-                        label="FP-Relevant", color="#fdae61")
-        bars2 = ax.bar([i + w/2 for i in x], fp_delta["FP-Spurious"], w,
-                        label="FP-Spurious", color="#d73027")
-        ax.set_xticks(list(x))
-        ax.set_xticklabels(fp_delta.index, rotation=30, ha="right")
-        ax.axhline(0, color="black", linewidth=0.8)
-        ax.set_ylabel("Δ Mean FP (ruleset − zeroshot)")
-        ax.set_title("FP Change with Ruleset")
-        ax.legend()
-        ax.bar_label(bars1, fmt="%+.1f", fontsize=8, padding=2)
-        ax.bar_label(bars2, fmt="%+.1f", fontsize=8, padding=2)
-        savefig(fig, "fp_delta")
-
-        # ============================================================
-        # 9. TP-Exact rate (tp_exact / tp) — tag precision
-        # ============================================================
-        tp_df = df[df["tp"] == 1].copy()
-        if len(tp_df) > 0:
-            exact_agg = tp_df.groupby(["model", "condition"], observed=True)["tp_exact"].mean().reset_index()
-            exact_agg.rename(columns={"tp_exact": "exact_rate"}, inplace=True)
-
-            fig, ax = plt.subplots(figsize=(10, 5))
-            sns.barplot(data=exact_agg, x="model", y="exact_rate", hue="condition",
-                        palette={"zeroshot": "#7faadc", "ruleset": "#f4a582"}, ax=ax)
-            ax.set_ylabel("Tag Accuracy (Exact / TP)")
-            ax.set_xlabel("")
-            ax.set_ylim(0, 1.15)
-            ax.set_title("Tag Accuracy among True Positives")
-            ax.legend(title="Condition")
-            for container in ax.containers:
-                ax.bar_label(container, fmt="%.2f", fontsize=8, padding=2)
-            savefig(fig, "tp_exact_rate")
-
-        # ============================================================
-        # 10. Summary heatmap (sensitivity: model × condition)
-        # ============================================================
-        sens_pivot = agg.pivot(index="model", columns="condition", values="sensitivity")
-        sens_pivot = sens_pivot.reindex(model_order)[["zeroshot", "ruleset"]]
-
-        fig, ax = plt.subplots(figsize=(5, 5))
-        sns.heatmap(sens_pivot, annot=True, fmt=".2f", cmap="YlGn",
-                    vmin=0, vmax=1, linewidths=0.5, ax=ax)
-        ax.set_title("Sensitivity Overview")
-        ax.set_ylabel("")
-        ax.set_xlabel("")
-        savefig(fig, "sensitivity_heatmap")
-
-        # ============================================================
-        # 11. Duration boxplot
-        # ============================================================
-        dur_df = df[df["duration_s"].notna()].copy()
-        if len(dur_df) > 0:
-            # CSV
-            dur_csv = dur_df[["model", "condition", "case", "duration_s"]].sort_values(
-                ["condition", "model", "case"])
-            dur_csv.to_csv(outdir / "duration.csv", index=False)
-            print(f"  {outdir}/duration.csv")
-
-            # boxplot: model × condition (log scale)
-            fig, ax = plt.subplots(figsize=(10, 5))
-            sns.boxplot(data=dur_df, x="model", y="duration_s", hue="condition",
-                        palette={"zeroshot": "#7faadc", "ruleset": "#f4a582"}, ax=ax)
-            ax.set_yscale("log")
-            ax.set_ylabel("Duration (s, log scale)")
-            ax.set_xlabel("")
-            ax.set_title("Response Time per Case")
-            ax.legend(title="Condition")
-            savefig(fig, "duration_boxplot")
-
-            # summary stats csv
-            dur_stats = dur_df.groupby(["model", "condition"], observed=True)["duration_s"].describe()
-            dur_stats = dur_stats[["count", "mean", "std", "min", "50%", "max"]]
-            dur_stats.columns = ["n", "mean", "std", "min", "median", "max"]
-            dur_stats = dur_stats.round(1)
-            dur_stats.to_csv(outdir / "duration_stats.csv")
-            print(f"  {outdir}/duration_stats.csv")
-
-        print(f"\nAll figures saved to {outdir}/")
+                # duration stats
+                dur = cases_df[cases_df["duration_s"].notna()]
+                if len(dur) > 0:
+                    dur_stats = dur.groupby(["model", "condition"])["duration_s"].describe()
+                    dur_stats = dur_stats[["count", "mean", "std", "min", "50%", "max"]]
+                    dur_stats.columns = ["n", "mean", "std", "min", "median", "max"]
+                    dur_stats = dur_stats.round(1)
+                    dur_stats.to_csv(outdir / "duration_stats.csv")
+                    print(f"Saved to {outdir}/duration_stats.csv")
 
 
 def main():

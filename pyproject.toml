@@ -27,4 +27,5 @@ build-backend = "hatchling.build"
 packages = ["patholint"]
 
 [project.scripts]
-patholint = "patholint.cli:main"
+cli = "patholint.cli:main"
+fig = "patholint.fig:main"
