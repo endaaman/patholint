@@ -226,7 +226,8 @@ class CLI(AutoCLI):
 
         fig, ax = plt.subplots(figsize=(7, 5))
         sns.heatmap(delta_df, annot=True, fmt=".2f", cmap="RdYlGn", center=0,
-                    vmin=-0.3, vmax=0.6, linewidths=0.5, ax=ax)
+                    vmin=-0.3, vmax=0.6, linewidths=0.5, linecolor="white", ax=ax)
+        ax.grid(False)
         ax.set_title("Δ Sensitivity (ruleset − zeroshot) by Error Type")
         ax.set_ylabel("")
         ax.set_xlabel("")
@@ -323,7 +324,8 @@ class CLI(AutoCLI):
 
         fig, ax = plt.subplots(figsize=(5, 5))
         sns.heatmap(sens_pivot, annot=True, fmt=".2f", cmap="YlGn",
-                    vmin=0, vmax=1, linewidths=0.5, ax=ax)
+                    vmin=0, vmax=1, linewidths=0.5, linecolor="white", ax=ax)
+        ax.grid(False)
         ax.set_title("Sensitivity Overview")
         ax.set_ylabel("")
         ax.set_xlabel("")
@@ -394,9 +396,16 @@ class CLI(AutoCLI):
         ax.set_xlabel("")
         ax.set_title("Per-Case Detection Results")
 
-        # vertical separators between models
+        # cell boundary grid (box-style)
+        ax.grid(False)
+        ax.set_xticks([i - 0.5 for i in range(len(col_order) + 1)], minor=True)
+        ax.set_yticks([i - 0.5 for i in range(len(cases) + 1)], minor=True)
+        ax.grid(which="minor", color="white", linewidth=0.3)
+        ax.tick_params(which="minor", length=0)
+
+        # thicker vertical separators between models
         for k in range(1, len(SHORT_ORDER)):
-            ax.axvline(k * 2 - 0.5, color="white", linewidth=1.5)
+            ax.axvline(k * 2 - 0.5, color="white", linewidth=2.5)
 
         # legend
         from matplotlib.patches import Patch
