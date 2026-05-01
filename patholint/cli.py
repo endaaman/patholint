@@ -23,7 +23,8 @@ MODELS = {
     # model_name: (host, port, description)
     "claude-opus-4-6":    ("litellm", None, "Claude Opus 4.6"),
     "claude-sonnet-4-6":  ("litellm", None, "Claude Sonnet 4.6"),
-    "deepseek-v3.2":      ("deepseek", 8000, "DeepSeek V3.2"),
+    "deepseek-v3.2":      ("dedicated", 8000, "DeepSeek V3.2"),
+    "kimi-k2.6":          ("dedicated", 8000, "Kimi K2.6"),
     "gpt-oss-20b":        ("litellm", None, "GPT-OSS 20B"),
     "gpt-oss-120b":       ("litellm", None, "GPT-OSS 120B"),
     "sip-jmed-13b":       ("litellm", None, "SIP-JMed 13B"),
@@ -109,8 +110,8 @@ def create_client(model: str) -> OpenAI:
             api_key=key,
             timeout=600,
         )
-    elif host_key == "deepseek":
-        host = os.environ.get("DEEPSEEK_HOST", "prism-llens")
+    elif host_key == "dedicated":
+        host = os.environ.get("DEDICATED_HOST", "prism-llens")
         return OpenAI(
             base_url=f"http://{host}:{port}/v1",
             api_key="none",
@@ -507,7 +508,7 @@ class CLI(AutoCLI):
         import subprocess
 
         scoring_models = [
-            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2",
+            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2", "kimi-k2.6",
             "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
         ]
         models = scoring_models if a.model == "all" else [a.model]
@@ -626,7 +627,7 @@ class CLI(AutoCLI):
         import re
 
         scoring_models = [
-            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2",
+            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2", "kimi-k2.6",
             "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
         ]
         for cond in CONDITIONS:
@@ -658,7 +659,7 @@ class CLI(AutoCLI):
         import re
 
         scoring_models = [
-            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2",
+            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2", "kimi-k2.6",
             "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
         ]
         models = scoring_models if a.model == "all" else [a.model]

@@ -14,13 +14,14 @@ CONDITIONS = ["zeroshot", "ruleset"]
 COND_PALETTE = {"zeroshot": "#7faadc", "ruleset": "#f4a582"}
 
 MODEL_ORDER = [
-    "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2",
+    "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2", "kimi-k2.6",
     "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
 ]
 SHORT_NAMES = {
     "claude-opus-4-6": "Opus",
     "claude-sonnet-4-6": "Sonnet",
     "deepseek-v3.2": "DeepSeek",
+    "kimi-k2.6": "Kimi",
     "gpt-oss-120b": "GPT-120B",
     "gpt-oss-20b": "GPT-20B",
     "sip-jmed-13b": "JMed-13B",
