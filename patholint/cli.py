@@ -140,7 +140,7 @@ def call_llm(client: OpenAI, model: str, messages: list[dict], temperature: floa
         model=model,
         messages=messages,
         temperature=temperature,
-        max_tokens=32768,
+        max_tokens=65536,
         stream=True,
         stream_options={"include_usage": True},
     )
