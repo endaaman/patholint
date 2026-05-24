@@ -21,10 +21,16 @@ PROJ_ROOT = Path(__file__).resolve().parent.parent
 
 MODELS = {
     # model_name: (host, port, description)
-    "claude-opus-4-6":    ("litellm", None, "Claude Opus 4.6"),
-    "claude-sonnet-4-6":  ("litellm", None, "Claude Sonnet 4.6"),
-    "deepseek-v3.2":      ("dedicated", 8000, "DeepSeek V3.2"),
-    "kimi-k2.6":          ("dedicated", 8000, "Kimi K2.6"),
+    "claude-opus-4-6":         ("litellm", None, "Claude Opus 4.6"),
+    "claude-opus-4-6-think":   ("litellm", None, "Claude Opus 4.6 (extended thinking)"),
+    "claude-sonnet-4-6":       ("litellm", None, "Claude Sonnet 4.6"),
+    "claude-sonnet-4-6-think": ("litellm", None, "Claude Sonnet 4.6 (extended thinking)"),
+    "deepseek-v3.2":         ("dedicated", 8000, "DeepSeek V3.2"),
+    "deepseek-v3.2-nothink": ("dedicated", 8000, "DeepSeek V3.2 (no think)"),
+    "kimi-k2.6":             ("dedicated", 8000, "Kimi K2.6"),
+    "kimi-k2.6-nothink":     ("dedicated", 8000, "Kimi K2.6 (no think)"),
+    "glm-5.1":               ("dedicated", 8000, "GLM-5.1 FP8"),
+    "glm-5.1-nothink":       ("dedicated", 8000, "GLM-5.1 FP8 (no think)"),
     "gpt-oss-20b":        ("litellm", None, "GPT-OSS 20B"),
     "gpt-oss-120b":       ("litellm", None, "GPT-OSS 120B"),
     "sip-jmed-13b":       ("litellm", None, "SIP-JMed 13B"),
@@ -36,6 +42,43 @@ MODELS = {
 }
 
 CONDITIONS = ["zeroshot", "ruleset"]
+
+# vLLM/SGLang 系で chat template の thinking 切替に渡す extra_body
+# Kimi-K2.6 の chat_template.jinja は `thinking` キーを参照
+# （`thinking is false` で <think></think> 空タグを挿入して reasoning を抑止）
+# Claude の extended thinking は litellm 経由で extra_body.thinking で指定。
+# Anthropic API 仕様で temperature=1.0 強制、max_tokens > budget_tokens 必須。
+CLAUDE_THINKING_BUDGET = 8000
+MODEL_EXTRA_BODY = {
+    "deepseek-v3.2":     {"chat_template_kwargs": {"thinking": True}},
+    "kimi-k2.6-nothink": {"chat_template_kwargs": {"thinking": False}},
+    "glm-5.1-nothink":   {"chat_template_kwargs": {"enable_thinking": False}},
+    "claude-opus-4-6-think":   {"thinking": {"type": "enabled", "budget_tokens": CLAUDE_THINKING_BUDGET}},
+    "claude-sonnet-4-6-think": {"thinking": {"type": "enabled", "budget_tokens": CLAUDE_THINKING_BUDGET}},
+}
+
+# nothink はループに陥りがちなので低めに、thinking 用は思考分の余裕を残す
+DEFAULT_MAX_TOKENS = 65536
+NOTHINK_MAX_TOKENS = 8192
+
+
+def get_max_tokens(model: str) -> int:
+    if model.endswith("-nothink"):
+        return NOTHINK_MAX_TOKENS
+    return DEFAULT_MAX_TOKENS
+
+
+def get_actual_model_name(model: str) -> str:
+    """エイリアス（-nothink/-think 等）を実モデル名に解決して送信する"""
+    for suffix in ("-nothink", "-think"):
+        if model.endswith(suffix):
+            return model[: -len(suffix)]
+    return model
+
+
+def needs_temp_one(model: str) -> bool:
+    """Claude extended thinking は temperature=1.0 必須"""
+    return model.endswith("-think") and model.startswith("claude-")
 
 
 def serialize_value(val):
@@ -136,14 +179,18 @@ def build_messages(body: str, condition: str) -> list[dict]:
 def call_llm(client: OpenAI, model: str, messages: list[dict], temperature: float) -> dict:
     """LLM呼び出しを実行し、結果を辞書で返す（streaming）"""
     t0 = time.time()
-    stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=65536,
-        stream=True,
-        stream_options={"include_usage": True},
-    )
+    kwargs = {
+        "model": get_actual_model_name(model),
+        "messages": messages,
+        "temperature": 1.0 if needs_temp_one(model) else temperature,
+        "max_tokens": get_max_tokens(model),
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    extra_body = MODEL_EXTRA_BODY.get(model)
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+    stream = client.chat.completions.create(**kwargs)
 
     chunks = []
     finish_reason = None
@@ -508,7 +555,10 @@ class CLI(AutoCLI):
         import subprocess
 
         scoring_models = [
-            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2", "kimi-k2.6",
+            "claude-opus-4-6", "claude-opus-4-6-think",
+            "claude-sonnet-4-6", "claude-sonnet-4-6-think",
+            "deepseek-v3.2", "deepseek-v3.2-nothink",
+            "kimi-k2.6", "kimi-k2.6-nothink", "glm-5.1", "glm-5.1-nothink",
             "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
         ]
         models = scoring_models if a.model == "all" else [a.model]
@@ -564,7 +614,7 @@ class CLI(AutoCLI):
                     input=content,
                     capture_output=True,
                     text=True,
-                    timeout=120,
+                    timeout=300,
                 )
                 if result.returncode != 0:
                     print(f"ERROR (exit {result.returncode}): {result.stderr[:200]}")
@@ -627,7 +677,10 @@ class CLI(AutoCLI):
         import re
 
         scoring_models = [
-            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2", "kimi-k2.6",
+            "claude-opus-4-6", "claude-opus-4-6-think",
+            "claude-sonnet-4-6", "claude-sonnet-4-6-think",
+            "deepseek-v3.2", "deepseek-v3.2-nothink",
+            "kimi-k2.6", "kimi-k2.6-nothink", "glm-5.1", "glm-5.1-nothink",
             "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
         ]
         for cond in CONDITIONS:
@@ -659,7 +712,10 @@ class CLI(AutoCLI):
         import re
 
         scoring_models = [
-            "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2", "kimi-k2.6",
+            "claude-opus-4-6", "claude-opus-4-6-think",
+            "claude-sonnet-4-6", "claude-sonnet-4-6-think",
+            "deepseek-v3.2", "deepseek-v3.2-nothink",
+            "kimi-k2.6", "kimi-k2.6-nothink", "glm-5.1", "glm-5.1-nothink",
             "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
         ]
         models = scoring_models if a.model == "all" else [a.model]

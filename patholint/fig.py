@@ -14,14 +14,24 @@ CONDITIONS = ["zeroshot", "ruleset"]
 COND_PALETTE = {"zeroshot": "#7faadc", "ruleset": "#f4a582"}
 
 MODEL_ORDER = [
-    "claude-opus-4-6", "claude-sonnet-4-6", "deepseek-v3.2", "kimi-k2.6",
+    "claude-opus-4-6", "claude-opus-4-6-think",
+    "claude-sonnet-4-6", "claude-sonnet-4-6-think",
+    "deepseek-v3.2", "deepseek-v3.2-nothink",
+    "kimi-k2.6", "kimi-k2.6-nothink",
+    "glm-5.1", "glm-5.1-nothink",
     "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
 ]
 SHORT_NAMES = {
     "claude-opus-4-6": "Opus",
+    "claude-opus-4-6-think": "Opus(t)",
     "claude-sonnet-4-6": "Sonnet",
+    "claude-sonnet-4-6-think": "Sonnet(t)",
     "deepseek-v3.2": "DeepSeek",
+    "deepseek-v3.2-nothink": "DeepSeek(nt)",
     "kimi-k2.6": "Kimi",
+    "kimi-k2.6-nothink": "Kimi(nt)",
+    "glm-5.1": "GLM",
+    "glm-5.1-nothink": "GLM(nt)",
     "gpt-oss-120b": "GPT-120B",
     "gpt-oss-20b": "GPT-20B",
     "sip-jmed-13b": "JMed-13B",
