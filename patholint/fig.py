@@ -14,8 +14,10 @@ CONDITIONS = ["zeroshot", "ruleset"]
 COND_PALETTE = {"zeroshot": "#7faadc", "ruleset": "#f4a582"}
 
 MODEL_ORDER = [
-    "claude-opus-4-6", "claude-opus-4-6-think",
-    "claude-sonnet-4-6", "claude-sonnet-4-6-think",
+    "claude-opus-4-6",
+    # "claude-opus-4-6-think",
+    "claude-sonnet-4-6",
+    # "claude-sonnet-4-6-think",
     "deepseek-v3.2", "deepseek-v3.2-nothink",
     "kimi-k2.6", "kimi-k2.6-nothink",
     "glm-5.1", "glm-5.1-nothink",
@@ -23,9 +25,9 @@ MODEL_ORDER = [
 ]
 SHORT_NAMES = {
     "claude-opus-4-6": "Opus",
-    "claude-opus-4-6-think": "Opus(t)",
+    # "claude-opus-4-6-think": "Opus(t)",
     "claude-sonnet-4-6": "Sonnet",
-    "claude-sonnet-4-6-think": "Sonnet(t)",
+    # "claude-sonnet-4-6-think": "Sonnet(t)",
     "deepseek-v3.2": "DeepSeek",
     "deepseek-v3.2-nothink": "DeepSeek(nt)",
     "kimi-k2.6": "Kimi",
@@ -110,6 +112,7 @@ class CLI(AutoCLI):
         ax.legend(title="Condition")
         for c in ax.containers:
             ax.bar_label(c, fmt="%.2f", fontsize=8, padding=2)
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
         savefig(fig, outdir, "overall_sensitivity")
 
     # ============================================================
@@ -130,6 +133,7 @@ class CLI(AutoCLI):
         ax.set_xlabel("")
         ax.set_title("Sensitivity Improvement with Ruleset")
         ax.bar_label(bars, fmt="%+.2f", fontsize=9, padding=2)
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
         savefig(fig, outdir, "overall_sensitivity_delta")
 
     # ============================================================
@@ -268,6 +272,7 @@ class CLI(AutoCLI):
             ax.legend(handles, ["Relevant", "Spurious"], title="FP Type")
             for c in ax.containers:
                 ax.bar_label(c, fmt="%.1f", fontsize=8, padding=2)
+            ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
             savefig(fig, outdir, f"fp_comparison_{cond}")
 
     # ============================================================
@@ -322,6 +327,7 @@ class CLI(AutoCLI):
         ax.legend(title="Condition")
         for c in ax.containers:
             ax.bar_label(c, fmt="%.2f", fontsize=8, padding=2)
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
         savefig(fig, outdir, "tp_exact_rate")
 
     # ============================================================
@@ -358,6 +364,7 @@ class CLI(AutoCLI):
         ax.set_xlabel("")
         ax.set_title("Response Time per Case")
         ax.legend(title="Condition")
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
         savefig(fig, outdir, "duration_boxplot")
 
     # ============================================================
