@@ -81,6 +81,46 @@ def needs_temp_one(model: str) -> bool:
     return model.endswith("-think") and model.startswith("claude-")
 
 
+# overall sensitivity 図のバー定義
+# key, group, group_label(x軸), legend_label, full_tone
+# full_tone=True が主バリアント(濃)、False が副(薄)。
+# DeepSeek/GLM/Kimi は think(濃)/no-think(薄) のペア。
+# GPT-OSS 120B/20B はペアにせず離すが、同系色(緑)で濃淡だけ変える。
+SENS_BARS = [
+    ("claude-opus-4-6",       "Opus",     "Opus 4.6",      "Opus 4.6",                 True),
+    ("claude-sonnet-4-6",     "Sonnet",   "Sonnet 4.6",    "Sonnet 4.6",               True),
+    ("kimi-k2.6",             "Kimi",     "Kimi K2.6",     "Kimi K2.6 (think)",        True),
+    ("kimi-k2.6-nothink",     "Kimi",     "Kimi K2.6",     "Kimi K2.6 (no-think)",     False),
+    ("glm-5.1",               "GLM",      "GLM 5.1",       "GLM 5.1 (think)",          True),
+    ("glm-5.1-nothink",       "GLM",      "GLM 5.1",       "GLM 5.1 (no-think)",       False),
+    ("deepseek-v3.2",         "DeepSeek", "DeepSeek V3.2", "DeepSeek V3.2 (think)",    True),
+    ("deepseek-v3.2-nothink", "DeepSeek", "DeepSeek V3.2", "DeepSeek V3.2 (no-think)", False),
+    ("gpt-oss-120b",          "GPT-120B", "GPT-OSS 120B",  "GPT-OSS 120B",             True),
+    ("gpt-oss-20b",           "GPT-20B",  "GPT-OSS 20B",   "GPT-OSS 20B",              False),
+]
+
+# GPT-120B / GPT-20B は別 group(ペアにせず離す)だが同系色(緑)で濃淡だけ変える
+SENS_COLORS = {
+    "Opus":     "#5B8FF9",
+    "Sonnet":   "#61C0BF",
+    "DeepSeek": "#F6A623",
+    "GLM":      "#9B59B6",
+    "Kimi":     "#E8684A",
+    "GPT-120B": "#3CA76B",
+    "GPT-20B":  "#3CA76B",
+}
+
+
+def lighten(hex_color: str, amount: float = 0.45) -> str:
+    """no-think 用に色を明るく(トーン違い)。"""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    r = int(r + (255 - r) * amount)
+    g = int(g + (255 - g) * amount)
+    b = int(b + (255 - b) * amount)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
 def serialize_value(val):
     if pd.isna(val):
         return None
@@ -696,6 +736,86 @@ class CLI(AutoCLI):
                 total = len(files)
                 bar = f"{'█' * scored}{'░' * (total - scored)}" if total <= 50 else ""
                 print(f"  {cond}/{model}: {scored}/{total} {bar}")
+
+    class PlotSensitivityArgs(BaseModel):
+        tally: str = param("out/tally.csv", s="-i", l="--tally")
+        out: str = param("out/figs/overall_sensitivity_ruleset.png", s="-o", l="--out")
+        condition: str = param("ruleset", s="-c", l="--condition", description="zeroshot | ruleset")
+
+    def run_plot_sensitivity(self, a: PlotSensitivityArgs):
+        """overall sensitivity 図を描画 (モデルごとに色分け、think/no-think はペア)"""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
+
+        df = pd.read_csv(a.tally)
+        df = df[(df["condition"] == a.condition) & (df["tag"] == "all")]
+        sens = dict(zip(df["model"], df["sensitivity"]))
+
+        # x 位置: ペア(同 group)は密着、別 group は広めの間隔
+        GAP_GROUP = 1.35
+        GAP_PAIR = 0.58
+        WIDTH = 0.54
+
+        xs = []
+        x = 0.0
+        prev_group = None
+        for i, b in enumerate(SENS_BARS):
+            group = b[1]
+            if i > 0:
+                x += GAP_PAIR if group == prev_group else GAP_GROUP
+            xs.append(x)
+            prev_group = group
+
+        fig, ax = plt.subplots(figsize=(12.0, 5.2))
+
+        for (key, group, glabel, llabel, full), x in zip(SENS_BARS, xs):
+            if key not in sens:
+                continue
+            base = SENS_COLORS[group]
+            color = base if full else lighten(base)
+            val = sens[key]
+            ax.bar(x, val, width=WIDTH, color=color,
+                   edgecolor="white", linewidth=0.8, zorder=3)
+            ax.text(x, val + 0.012, f"{val:.2f}", ha="center", va="bottom",
+                    fontsize=10, color="#333333")
+
+        # x 軸ラベル: group ごとに中央へ 1 つ(ペアは中点)
+        groups, ticks, labels = [], [], []
+        for (key, group, glabel, _, _), x in zip(SENS_BARS, xs):
+            if not groups or groups[-1][0] != group:
+                groups.append([group, glabel, [x]])
+            else:
+                groups[-1][2].append(x)
+        for group, glabel, gxs in groups:
+            ticks.append(sum(gxs) / len(gxs))
+            labels.append(glabel)
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(labels, fontsize=11, rotation=45, ha="right")
+
+        ax.set_ylabel("Sensitivity", fontsize=12)
+        ax.set_ylim(0, 1.0)
+        ax.set_title(f"Overall Sensitivity by Model ({a.condition})", fontsize=14, pad=12)
+        ax.grid(axis="y", alpha=0.3, zorder=0)
+        ax.set_axisbelow(True)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+
+        # legend: 各バーに対応(モデルで色分け、ペアは濃淡で主/副バリアント)
+        handles = []
+        for key, group, glabel, llabel, full in SENS_BARS:
+            base = SENS_COLORS[group]
+            handles.append(Patch(facecolor=base if full else lighten(base), label=llabel))
+        ax.legend(handles=handles, title="Model / variant",
+                  loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                  frameon=True, fontsize=9.5)
+
+        fig.tight_layout()
+        out_path = Path(a.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"saved: {out_path}")
 
 
     class TallyArgs(BaseModel):
