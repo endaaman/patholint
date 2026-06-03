@@ -44,6 +44,43 @@ TAG_ORDER = ["RuleViolation", "Deficiency", "Inconsistency", "Typo"]
 TAG_SHORT = {"RuleViolation": "RV", "Deficiency": "Def", "Inconsistency": "Inc", "Typo": "Typo"}
 TAG_SHORT_ORDER = [TAG_SHORT[t] for t in TAG_ORDER]
 
+# overall_sensitivity_ruleset 用のバー定義 (model は SHORT_NAMES 後の名前)
+# short, group, group_label(x軸), legend_label, full_tone
+# full_tone=True が主バリアント(濃)、False が副(薄)。
+# Kimi/GLM/DeepSeek は think(濃)/no-think(薄) のペア(密着)。
+# GPT-OSS 120B/20B はペアにせず離すが、同系色(緑)で濃淡だけ変える。
+SENS_RULESET_BARS = [
+    ("Opus",         "Opus",     "Opus 4.6",      "Opus 4.6",                 True),
+    ("Sonnet",       "Sonnet",   "Sonnet 4.6",    "Sonnet 4.6",               True),
+    ("Kimi",         "Kimi",     "Kimi K2.6",     "Kimi K2.6 (think)",        True),
+    ("Kimi(nt)",     "Kimi",     "Kimi K2.6",     "Kimi K2.6 (no-think)",     False),
+    ("GLM",          "GLM",      "GLM 5.1",       "GLM 5.1 (think)",          True),
+    ("GLM(nt)",      "GLM",      "GLM 5.1",       "GLM 5.1 (no-think)",       False),
+    ("DeepSeek",     "DeepSeek", "DeepSeek V3.2", "DeepSeek V3.2 (think)",    True),
+    ("DeepSeek(nt)", "DeepSeek", "DeepSeek V3.2", "DeepSeek V3.2 (no-think)", False),
+    ("GPT-120B",     "GPT-120B", "GPT-OSS 120B",  "GPT-OSS 120B",             True),
+    ("GPT-20B",      "GPT-20B",  "GPT-OSS 20B",   "GPT-OSS 20B",              False),
+]
+SENS_RULESET_COLORS = {
+    "Opus":     "#5B8FF9",
+    "Sonnet":   "#61C0BF",
+    "DeepSeek": "#F6A623",
+    "GLM":      "#9B59B6",
+    "Kimi":     "#E8684A",
+    "GPT-120B": "#3CA76B",
+    "GPT-20B":  "#3CA76B",
+}
+
+
+def lighten(hex_color: str, amount: float = 0.45) -> str:
+    """no-think 用に色を明るく(トーン違い)。"""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    r = int(r + (255 - r) * amount)
+    g = int(g + (255 - g) * amount)
+    b = int(b + (255 - b) * amount)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
 
 def load_cases(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
@@ -80,6 +117,7 @@ class CLI(AutoCLI):
         df = load_cases(a.cases)
 
         self._plot_sensitivity(df, outdir)
+        self._plot_sensitivity_ruleset(df, outdir)
         self._plot_sensitivity_delta(df, outdir)
         self._plot_detection_breakdown(df, outdir)
         self._plot_sensitivity_by_tag(df, outdir)
@@ -114,6 +152,72 @@ class CLI(AutoCLI):
             ax.bar_label(c, fmt="%.2f", fontsize=8, padding=2)
         ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
         savefig(fig, outdir, "overall_sensitivity")
+
+    # ============================================================
+    # 1b. Overall sensitivity (ruleset のみ, モデル色分け)
+    # ============================================================
+    def _plot_sensitivity_ruleset(self, df, outdir):
+        agg = df[df["condition"] == "ruleset"].groupby("model", observed=True)["tp"].mean()
+        sens = agg.to_dict()
+
+        # x 位置: ペア(同 group)は密着、別 group は広めの間隔
+        GAP_GROUP = 1.35
+        GAP_PAIR = 0.58
+        WIDTH = 0.54
+
+        xs = []
+        x = 0.0
+        prev_group = None
+        for i, b in enumerate(SENS_RULESET_BARS):
+            group = b[1]
+            if i > 0:
+                x += GAP_PAIR if group == prev_group else GAP_GROUP
+            xs.append(x)
+            prev_group = group
+
+        fig, ax = plt.subplots(figsize=(12.0, 5.2))
+        for (short, group, glabel, llabel, full), x in zip(SENS_RULESET_BARS, xs):
+            if short not in sens:
+                continue
+            base = SENS_RULESET_COLORS[group]
+            color = base if full else lighten(base)
+            val = sens[short]
+            ax.bar(x, val, width=WIDTH, color=color,
+                   edgecolor="white", linewidth=0.8, zorder=3)
+            ax.text(x, val + 0.012, f"{val:.2f}", ha="center", va="bottom",
+                    fontsize=10, color="#333333")
+
+        # x 軸ラベル: group ごとに中央へ 1 つ(ペアは中点)
+        groups, ticks, labels = [], [], []
+        for (short, group, glabel, _, _), x in zip(SENS_RULESET_BARS, xs):
+            if not groups or groups[-1][0] != group:
+                groups.append([group, glabel, [x]])
+            else:
+                groups[-1][2].append(x)
+        for group, glabel, gxs in groups:
+            ticks.append(sum(gxs) / len(gxs))
+            labels.append(glabel)
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(labels, fontsize=11, rotation=45, ha="right")
+
+        ax.set_ylabel("Sensitivity")
+        ax.set_ylim(0, 1.0)
+        ax.set_title("Overall Sensitivity by Model (ruleset)")
+        ax.grid(axis="y", alpha=0.3, zorder=0)
+        ax.set_axisbelow(True)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+
+        # legend: 各バーに対応(モデルで色分け、ペアは濃淡で主/副バリアント)
+        from matplotlib.patches import Patch
+        handles = []
+        for short, group, glabel, llabel, full in SENS_RULESET_BARS:
+            base = SENS_RULESET_COLORS[group]
+            handles.append(Patch(facecolor=base if full else lighten(base), label=llabel))
+        ax.legend(handles=handles, title="Model / variant",
+                  loc="upper left", bbox_to_anchor=(1.01, 1.0), frameon=True, fontsize=9.5)
+
+        savefig(fig, outdir, "overall_sensitivity_ruleset")
 
     # ============================================================
     # 2. Sensitivity delta
