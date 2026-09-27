@@ -1,7 +1,9 @@
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -42,6 +44,12 @@ MODELS = {
     # enda-spark ローカル (prism-gw :4000 → SGLang + DFlash2)。prism-hu/chat の sglang-qwen38
     "qwen3.8-27b":         ("litellm", None, "Qwen3.8 27B (SGLang, Spark)"),
     "qwen3.8-27b-nothink": ("litellm", None, "Qwen3.8 27B (SGLang, Spark, no think)"),
+    # thinking ON を推奨サンプリング + 思考長上限つきで回す派生（下の QWEN38_VARIANTS）
+    "qwen3.8-27b-think":   ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think, 推奨サンプリング, 上限なし)"),
+    "qwen3.8-27b-t1k":     ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think budget 1k)"),
+    "qwen3.8-27b-t2k":     ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think budget 2k)"),
+    "qwen3.8-27b-t4k":     ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think budget 4k)"),
+    "qwen3.8-27b-t1kx2":   ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think budget 1k x 2 samples, union)"),
 }
 
 # `-c all` で回す条件（ruleset 有無の比較実験）。fast は別系統なので明示指定のみ
@@ -76,6 +84,7 @@ SCORING_MODELS = [
     "kimi-k2.6", "kimi-k2.6-nothink", "glm-5.1", "glm-5.1-nothink",
     "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
     "qwen3.8-27b", "qwen3.8-27b-nothink",
+    "qwen3.8-27b-think", "qwen3.8-27b-t1k", "qwen3.8-27b-t2k", "qwen3.8-27b-t4k", "qwen3.8-27b-t1kx2",
 ]
 
 # vLLM/SGLang 系で chat template の thinking 切替に渡す extra_body
@@ -98,15 +107,42 @@ MODEL_EXTRA_BODY = {
 DEFAULT_MAX_TOKENS = 65536
 NOTHINK_MAX_TOKENS = 8192
 
+# Qwen3.8-27B thinking ON の派生。alias: thinking budget（None = 上限なし）
+# - サンプリングは Qwen 推奨値。CLI の --temperature より優先する
+#   （ただしサンプリングを直しても思考は 5k–16k+ tok 続き、content 空で終わることもある）
+# - budget はクライアント側で掛ける: 1回目を max_tokens=budget で生成し、length で切れたら
+#   思考を閉じた assistant prefill（continue_final_message）で回答だけを生成させる。
+#   サーバ側の設定（--enable-strict-thinking 等）には依存しない
+QWEN38_SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+QWEN38_VARIANTS = {
+    "qwen3.8-27b-think": None,
+    "qwen3.8-27b-t1k": 1024,
+    "qwen3.8-27b-t2k": 2048,
+    "qwen3.8-27b-t4k": 4096,
+    "qwen3.8-27b-t1kx2": 1024,
+}
+# 同じ条件で独立に N 回サンプルし（並列）、指摘の和集合を回答にする派生。
+# 1 サンプルごとの見逃しがばらつくので、和集合で recall を稼ぐ（FP も増える）
+QWEN38_SAMPLES = {
+    "qwen3.8-27b-t1kx2": 2,
+}
+# 思考を閉じた後の回答分（2回目の呼び出しの max_tokens）
+BUDGET_ANSWER_TOKENS = 4096
+
 
 def get_max_tokens(model: str) -> int:
     if model.endswith("-nothink"):
         return NOTHINK_MAX_TOKENS
+    budget = QWEN38_VARIANTS.get(model)
+    if budget is not None:
+        return budget
     return DEFAULT_MAX_TOKENS
 
 
 def get_actual_model_name(model: str) -> str:
     """エイリアス（-nothink/-think 等）を実モデル名に解決して送信する"""
+    if model in QWEN38_VARIANTS:
+        return "qwen3.8-27b"
     for suffix in ("-nothink", "-think"):
         if model.endswith(suffix):
             return model[: -len(suffix)]
@@ -250,11 +286,61 @@ def merge_results(results: list[dict]) -> dict:
         "completion_tokens": sum(r["completion_tokens"] for r in results),
         "thinking_tokens": sum(thinking) if thinking else None,
         "duration_s": round(sum(r["duration_s"] for r in results), 2),
+        **({"forced_answer": True} if any(r.get("forced_answer") for r in results) else {}),
     }
 
 
-def call_llm(client: OpenAI, model: str, messages: list[dict], temperature: float) -> dict:
-    """LLM呼び出しを実行し、結果を辞書で返す（streaming）"""
+def _stream_chat(client: OpenAI, kwargs: dict) -> dict:
+    """streaming で1回呼び出し、content / reasoning_content を分けて集める。
+    途中で stream を閉じても prism-gw 越しでは上流が止まらない（生成が裏で続く）ので、
+    長さの制御は必ず max_tokens で行うこと"""
+    stream = client.chat.completions.create(**kwargs)
+    content, reasoning = [], []
+    finish_reason = None
+    usage = None
+    for chunk in stream:
+        if chunk.usage:
+            usage = chunk.usage
+        if chunk.choices:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content.append(delta.content)
+            rc = getattr(delta, "reasoning_content", None)
+            if rc:
+                reasoning.append(rc)
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+    return {
+        "content": "".join(content).strip(),
+        "reasoning": "".join(reasoning),
+        "finish_reason": finish_reason,
+        "usage": usage,
+    }
+
+
+def _usage_tokens(usage) -> tuple[int, int, int | None]:
+    if not usage:
+        return 0, 0, None
+    raw_usage = usage.model_dump()
+    thinking = raw_usage.get("reasoning_tokens") or (raw_usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    return usage.prompt_tokens, usage.completion_tokens, thinking
+
+
+def _answer_prefill(reasoning: str, content: str, truncated: bool) -> str:
+    """思考を閉じて回答を続けさせるための assistant prefill（chat template の `<think>\n` の後ろに付く）"""
+    if content:
+        return reasoning.rstrip() + "\n</think>\n\n" + content
+    if truncated:
+        # 思考が行の途中で切れているので、最後の改行までに丸めてから閉じる
+        cut = reasoning.rfind("\n")
+        if cut > len(reasoning) // 2:
+            reasoning = reasoning[:cut]
+        reasoning = reasoning.rstrip() + "\n\n（思考の上限に達したので、ここまでの検討に基づいて回答する）"
+    return reasoning.rstrip() + "\n</think>\n\n"
+
+
+def _call_llm_once(client: OpenAI, model: str, messages: list[dict], temperature: float) -> dict:
+    """LLM呼び出しを1回実行し、結果を辞書で返す（streaming）"""
     t0 = time.time()
     kwargs = {
         "model": get_actual_model_name(model),
@@ -264,40 +350,55 @@ def call_llm(client: OpenAI, model: str, messages: list[dict], temperature: floa
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    extra_body = MODEL_EXTRA_BODY.get(model)
+    extra_body = dict(MODEL_EXTRA_BODY.get(model) or {})
+    is_qwen38_variant = model in QWEN38_VARIANTS
+    budget = QWEN38_VARIANTS.get(model)
+    if is_qwen38_variant:
+        kwargs["temperature"] = QWEN38_SAMPLING["temperature"]
+        kwargs["top_p"] = QWEN38_SAMPLING["top_p"]
+        extra_body["top_k"] = QWEN38_SAMPLING["top_k"]
     if extra_body:
         kwargs["extra_body"] = extra_body
-    stream = client.chat.completions.create(**kwargs)
 
-    chunks = []
-    finish_reason = None
-    usage = None
-    for chunk in stream:
-        if chunk.usage:
-            usage = chunk.usage
-        if chunk.choices:
-            delta = chunk.choices[0].delta
-            if delta.content:
-                chunks.append(delta.content)
-            if chunk.choices[0].finish_reason:
-                finish_reason = chunk.choices[0].finish_reason
+    r = _stream_chat(client, kwargs)
+    prompt_tokens, completion_tokens, thinking_tokens = _usage_tokens(r["usage"])
+    finish_reason = r["finish_reason"]
+    answer = r["content"]
+    forced = False
+
+    # thinking 派生: budget で切れた、または思考中に終了して content が空なら、
+    # 思考を閉じた assistant prefill で回答（の続き）を生成させる
+    truncated = budget is not None and finish_reason == "length"
+    if is_qwen38_variant and r["reasoning"] and (truncated or not answer):
+        kwargs2 = dict(kwargs)
+        kwargs2["messages"] = messages + [
+            {"role": "assistant", "content": _answer_prefill(r["reasoning"], answer, truncated)}
+        ]
+        kwargs2["max_tokens"] = BUDGET_ANSWER_TOKENS
+        kwargs2["extra_body"] = {**extra_body, "continue_final_message": True}
+        if not answer:
+            # 思考によっては </think> 直後に EOS を出して空になる（並列時に 1–3/20 件）。
+            # 空回答は正解になり得ない（最低でも「問題なし」）ので EOS を最初の数トークン禁止する
+            kwargs2["extra_body"]["min_tokens"] = 2
+        # それでも空なら1回だけ引き直す
+        for _ in range(2):
+            r2 = _stream_chat(client, kwargs2)
+            _, c2, _ = _usage_tokens(r2["usage"])
+            completion_tokens += c2
+            if r2["content"] or answer:
+                break
+        answer = (answer + r2["content"]).strip() if answer else r2["content"]
+        finish_reason = r2["finish_reason"]
+        forced = not r["content"]
 
     duration = time.time() - t0
-    answer = "".join(chunks).strip()
-
-    prompt_tokens = usage.prompt_tokens if usage else 0
-    completion_tokens = usage.completion_tokens if usage else 0
-    thinking_tokens = None
-    if usage:
-        raw_usage = usage.model_dump()
-        thinking_tokens = raw_usage.get("reasoning_tokens") or (raw_usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
 
     # 空応答デバッグ
     if not answer and completion_tokens > 0:
         print(f"WARNING: empty content despite {completion_tokens} completion tokens", file=sys.stderr)
         print(f"  finish_reason: {finish_reason}", file=sys.stderr)
 
-    return {
+    result = {
         "answer": answer,
         "finish_reason": finish_reason,
         "prompt_tokens": prompt_tokens,
@@ -305,6 +406,50 @@ def call_llm(client: OpenAI, model: str, messages: list[dict], temperature: floa
         "thinking_tokens": thinking_tokens,
         "duration_s": round(duration, 2),
     }
+    if forced:
+        result["forced_answer"] = True
+    return result
+
+
+def union_answers(answers: list[str]) -> str:
+    """複数サンプルの回答を行単位で和集合にする（完全一致の重複は除く）。全部「問題なし」なら「問題なし」"""
+    lines = []
+    for a in answers:
+        for line in a.splitlines():
+            line = line.strip()
+            if line and not is_no_problem(line) and line not in lines:
+                lines.append(line)
+    if lines:
+        return "\n".join(lines)
+    return "問題なし" if any(a.strip() for a in answers) else ""
+
+
+def call_llm(client: OpenAI, model: str, messages: list[dict], temperature: float) -> dict:
+    """LLM呼び出しを実行し、結果を辞書で返す。QWEN38_SAMPLES の派生は N 並列サンプルの和集合"""
+    n = QWEN38_SAMPLES.get(model, 1)
+    if n <= 1:
+        return _call_llm_once(client, model, messages, temperature)
+    t0 = time.time()
+    with ThreadPoolExecutor(n) as ex:
+        results = list(ex.map(lambda _: _call_llm_once(client, model, messages, temperature), range(n)))
+    thinking = [r["thinking_tokens"] for r in results if r["thinking_tokens"]]
+    finish_reasons = [r["finish_reason"] for r in results]
+    result = {
+        "answer": union_answers([r["answer"] for r in results]),
+        "finish_reason": "length" if "length" in finish_reasons else finish_reasons[-1],
+        "prompt_tokens": sum(r["prompt_tokens"] for r in results),
+        "completion_tokens": sum(r["completion_tokens"] for r in results),
+        "thinking_tokens": sum(thinking) if thinking else None,
+        # 並列なので所要時間は壁時計（最も遅いサンプル）
+        "duration_s": round(time.time() - t0, 2),
+    }
+    if any(r.get("forced_answer") for r in results):
+        result["forced_answer"] = True
+    return result
+
+
+# batch --parallel で _meta.jsonl への追記が混ざらないように
+_META_LOCK = threading.Lock()
 
 
 def run_one(client: OpenAI, report_path: Path, model: str, condition: str,
@@ -354,8 +499,10 @@ def run_one(client: OpenAI, report_path: Path, model: str, condition: str,
         "duration_s": result["duration_s"],
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
+    if result.get("forced_answer"):
+        meta["forced_answer"] = True
     meta_path = out_dir / "_meta.jsonl"
-    with open(meta_path, "a") as f:
+    with _META_LOCK, open(meta_path, "a") as f:
         f.write(json.dumps(meta, ensure_ascii=False) + "\n")
 
     return result
@@ -508,6 +655,7 @@ class CLI(AutoCLI):
         temperature: float = param(0.3, s="-t", l="--temperature")
         force: bool = param(False, l="--force", description="既存結果を上書き")
         dry_run: bool = param(False, l="--dry-run", description="API呼び出しせず件数とプロンプトサイズを表示")
+        parallel: int = param(1, s="-p", l="--parallel", description="同時リクエスト数（SGLang 等の連続バッチング向け）")
 
     def run_batch(self, a: BatchArgs):
         models = list(MODELS.keys()) if a.model == "all" else [a.model]
@@ -546,35 +694,62 @@ class CLI(AutoCLI):
                 done = 0
                 errors = 0
 
-                for i, rpath in enumerate(report_files):
-                    report_id = rpath.stem
-                    prefix = f"[{m}/{cond}] [{i+1}/{total}] {report_id}"
-
-                    print(f"{prefix}: ", end="", flush=True)
-
-                    try:
-                        result = run_one(client, rpath, m, cond, a.outdir, a.temperature, a.force)
-                    except Exception as e:
-                        errors += 1
-                        print(f"ERROR: {e}")
-                        continue
-
+                def describe(result) -> str:
                     if result is None:
-                        skipped += 1
-                        print("skip (exists)")
-                    else:
-                        done += 1
-                        tokens_info = f"{result['prompt_tokens']}+{result['completion_tokens']}"
-                        if result["thinking_tokens"]:
-                            tokens_info += f"(think:{result['thinking_tokens']})"
-                        extra = ""
-                        if result["finish_reason"] == "length":
-                            extra = " TRUNCATED"
-                        elif not result["answer"]:
-                            extra = " EMPTY"
-                        print(f"done ({tokens_info} tokens, {result['duration_s']:.1f}s){extra}")
+                        return "skip (exists)"
+                    tokens_info = f"{result['prompt_tokens']}+{result['completion_tokens']}"
+                    if result["thinking_tokens"]:
+                        tokens_info += f"(think:{result['thinking_tokens']})"
+                    extra = ""
+                    if result["finish_reason"] == "length":
+                        extra = " TRUNCATED"
+                    elif not result["answer"]:
+                        extra = " EMPTY"
+                    if result.get("forced_answer"):
+                        extra += " FORCED"
+                    return f"done ({tokens_info} tokens, {result['duration_s']:.1f}s){extra}"
 
-                print(f"[{m}/{cond}] Finished: {done} done, {skipped} skipped, {errors} errors")
+                t_start = time.time()
+                if a.parallel <= 1:
+                    for i, rpath in enumerate(report_files):
+                        prefix = f"[{m}/{cond}] [{i+1}/{total}] {rpath.stem}"
+                        print(f"{prefix}: ", end="", flush=True)
+                        try:
+                            result = run_one(client, rpath, m, cond, a.outdir, a.temperature, a.force)
+                        except Exception as e:
+                            errors += 1
+                            print(f"ERROR: {e}")
+                            continue
+                        if result is None:
+                            skipped += 1
+                        else:
+                            done += 1
+                        print(describe(result))
+                else:
+                    # 同時に N 件投げる（SGLang の連続バッチングで総スループットを稼ぐ）。
+                    # 表示は完了順。duration_s は各リクエスト単体の所要時間（待ち込み）
+                    with ThreadPoolExecutor(a.parallel) as ex:
+                        futures = {
+                            ex.submit(run_one, client, rpath, m, cond, a.outdir, a.temperature, a.force): rpath
+                            for rpath in report_files
+                        }
+                        for n, fut in enumerate(as_completed(futures)):
+                            prefix = f"[{m}/{cond}] [{n+1}/{total}] {futures[fut].stem}"
+                            try:
+                                result = fut.result()
+                            except Exception as e:
+                                errors += 1
+                                print(f"{prefix}: ERROR: {e}", flush=True)
+                                continue
+                            if result is None:
+                                skipped += 1
+                            else:
+                                done += 1
+                            print(f"{prefix}: {describe(result)}", flush=True)
+
+                wall = time.time() - t_start
+                per = f", wall {wall:.1f}s ({wall / done:.1f}s/report)" if done else ""
+                print(f"[{m}/{cond}] Finished: {done} done, {skipped} skipped, {errors} errors{per}")
 
     class TestArgs(BaseModel):
         model: str = param("gpt-oss-20b", s="-m", l="--model")

@@ -50,6 +50,44 @@ uv run cli score -m qwen3.8-27b-nothink -c fast
 uv run cli tally -m qwen3.8-27b-nothink -c fast --by-tag
 ```
 
+##### thinking ON + 思考長上限（推奨: `qwen3.8-27b-t1kx2` × `fast` × `-p 8`）
+
+Qwen3.8-27B の thinking は上限なしだと 5k–16k+ tok 続き（10 分近く）、content 空で終わることもある。
+サンプリングを推奨値にしても止まらないので、思考長に上限を掛ける派生エイリアスを用意している。
+
+| モデル | 思考上限 | 備考 |
+|---|---|---|
+| `qwen3.8-27b-t1kx2` | 1024 tok × 2 サンプル | **推奨**。独立 2 サンプル（並列）の指摘の和集合 |
+| `qwen3.8-27b-t1k` | 1024 tok | 最速側 |
+| `qwen3.8-27b-t2k` | 2048 tok | t1kx2 と同コストだが 1 本なので揺れが大きい |
+| `qwen3.8-27b-t4k` | 4096 tok | 遅い割に伸びない |
+| `qwen3.8-27b-think` | なし | 参考用（実用にならない） |
+
+全 50 件の実測（2026-09-28、enda-spark、sglang-qwen38 = DFLASH / max-running 16）:
+
+| モデル × fast | 並列 | 実効 s/件 | 1件 中央値 | Inconsistency | Typo | FP rel/spu |
+|---|---|---|---|---|---|---|
+| `qwen3.8-27b-nothink` | 1 | 5.1 | 2.9s | 11/15 | 2/5 | 0.10/0.76 |
+| `qwen3.8-27b-t1k` | 16 | 5.2 | 70s | 13/15 | 1/5 | 0.32/0.70 |
+| `qwen3.8-27b-t2k` | 16 | 10.5 | 144s | 12/15 | 1/5 | 0.26/0.84 |
+| **`qwen3.8-27b-t1kx2`** | 8 | 9.7 | 73s | **14/15** | 2/5 | 0.42/1.42 |
+
+サンプリングがあるので 1 回ごとに Inconsistency が ±2 件揺れる（t2k は反復 6 回で平均 0.89）。
+単発（並列なし）の所要時間は t1k ~32s、t2k ~58s。
+
+- サンプリングは Qwen 推奨値（temperature 0.6 / top_p 0.95 / top_k 20）固定。`-t` は効かない
+- 1回目を `max_tokens=budget` で生成し、思考が上限で切れたら（または思考中に終了したら）思考を閉じた
+  assistant prefill（`continue_final_message`）で回答だけを生成させる。サーバ側の設定には依存しない
+  （このとき meta に `forced_answer: true` が付く。実測では t1k–t4k のほぼ全件がこの経路）
+- `batch -p N` で N 件を同時に投げる。SGLang の連続バッチングで総スループットが伸びるので、
+  sglang-qwen38（`--max-running-requests=16`）には同時リクエストが 16 本になるように投げる
+  （`t1kx2` は 1 件 2 本なので `-p 8`、それ以外は `-p 16`）
+
+```bash
+uv run cli batch -m qwen3.8-27b-t1kx2 -c fast -p 8
+uv run cli score -m qwen3.8-27b-t1kx2 -c fast
+```
+
 #### スコアリング
 
 ```bash
