@@ -22,7 +22,32 @@ uv run cli test -m gpt-oss-20b  # 疎通テスト
 
 ```bash
 uv run cli single -r 0001 -m claude-opus-4-6 --ruleset  # 単発
-uv run cli batch -m all -c all                           # 全モデル×全条件
+uv run cli batch -m all -c all                           # 全モデル×全条件 (zeroshot+ruleset)
+```
+
+条件 (`-c`):
+
+| 条件 | プロンプト | ruleset | 備考 |
+|---|---|---|---|
+| `zeroshot` | `prompts/instruction.md` | なし | 4分類 |
+| `ruleset` | `prompts/instruction.md` | `data/kiyaku/crc_ruleset.md` | 4分類 |
+| `fast` | `prompts/instruction_fast.md` | なし | Typo / Inconsistency のみ。nothink モデルと組み合わせる高速版 |
+| `fast2` | `prompts/instruction_fast_typo.md` + `prompts/instruction_fast_inconsistency.md` | なし | fast を Typo 専用・Inconsistency 専用の2回呼び出しに分割し、出力を連結（tokens/duration は合算） |
+
+`-c all` は従来どおり `zeroshot` + `ruleset` のみ（fast / fast2 は明示指定）。
+
+#### 高速版 (fast): Qwen3.8-27B on DGX Spark
+
+enda-spark の prism-gw (:4000) 経由で SGLang の Qwen3.8-27B (`qwen3.8-27b`) を使う。
+`-nothink` は `chat_template_kwargs.enable_thinking=false` を付けて送る。
+SGLang は prism-hu/chat 側で `docker compose --profile heavy up -d sglang-qwen38`（大物は同時に1つだけ）。
+`.env` は `LITELLM_HOST=localhost` / `LITELLM_MASTER_KEY=<PRISM_GW_API_KEY>`。
+
+```bash
+uv run cli single -r 0001 -m qwen3.8-27b-nothink -c fast
+uv run cli batch -m qwen3.8-27b-nothink -c fast
+uv run cli score -m qwen3.8-27b-nothink -c fast
+uv run cli tally -m qwen3.8-27b-nothink -c fast --by-tag
 ```
 
 #### スコアリング

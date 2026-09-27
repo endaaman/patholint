@@ -39,9 +39,44 @@ MODELS = {
     "nemotron-3-super":   ("litellm", None, "Nemotron-3 Super"),
     "qwen3.5-9b":         ("litellm", None, "Qwen 3.5 9B"),
     "qwen3.5-27b":        ("litellm", None, "Qwen 3.5 27B"),
+    # enda-spark ローカル (prism-gw :4000 → SGLang + DFlash2)。prism-hu/chat の sglang-qwen38
+    "qwen3.8-27b":         ("litellm", None, "Qwen3.8 27B (SGLang, Spark)"),
+    "qwen3.8-27b-nothink": ("litellm", None, "Qwen3.8 27B (SGLang, Spark, no think)"),
 }
 
+# `-c all` で回す条件（ruleset 有無の比較実験）。fast は別系統なので明示指定のみ
 CONDITIONS = ["zeroshot", "ruleset"]
+# condition: (instruction prompt 名のリスト, ruleset を含めるか)
+# プロンプトが複数ある条件は1件につきプロンプトごとに呼び出し、出力を連結する
+# fast: Typo/Inconsistency 限定の短いプロンプト、ruleset なし（nothink モデルと組み合わせて高速化）
+# fast2: fast を Typo 専用 + Inconsistency 専用の2回呼び出しに分割
+#        （nothink だと1回の呼び出しでは片方の種類しか挙げない傾向があるため）
+CONDITION_PROMPTS = {
+    "zeroshot": (["instruction"], False),
+    "ruleset":  (["instruction"], True),
+    "fast":     (["instruction_fast"], False),
+    "fast2":    (["instruction_fast_typo", "instruction_fast_inconsistency"], False),
+}
+ALL_CONDITIONS = list(CONDITION_PROMPTS.keys())
+
+
+def resolve_conditions(condition: str) -> list[str]:
+    if condition == "all":
+        return CONDITIONS
+    if condition not in CONDITION_PROMPTS:
+        raise ValueError(f"Unknown condition: {condition} (available: {', '.join(ALL_CONDITIONS)}, all)")
+    return [condition]
+
+
+# score / score-status / tally の対象モデル
+SCORING_MODELS = [
+    "claude-opus-4-6", "claude-opus-4-6-think",
+    "claude-sonnet-4-6", "claude-sonnet-4-6-think",
+    "deepseek-v3.2", "deepseek-v3.2-nothink",
+    "kimi-k2.6", "kimi-k2.6-nothink", "glm-5.1", "glm-5.1-nothink",
+    "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
+    "qwen3.8-27b", "qwen3.8-27b-nothink",
+]
 
 # vLLM/SGLang 系で chat template の thinking 切替に渡す extra_body
 # Kimi-K2.6 の chat_template.jinja は `thinking` キーを参照
@@ -53,6 +88,8 @@ MODEL_EXTRA_BODY = {
     "deepseek-v3.2":     {"chat_template_kwargs": {"thinking": True}},
     "kimi-k2.6-nothink": {"chat_template_kwargs": {"thinking": False}},
     "glm-5.1-nothink":   {"chat_template_kwargs": {"enable_thinking": False}},
+    # SGLang (--reasoning-parser qwen3)。prism-gw は extra_body を素通しする
+    "qwen3.8-27b-nothink": {"chat_template_kwargs": {"enable_thinking": False}},
     "claude-opus-4-6-think":   {"thinking": {"type": "enabled", "budget_tokens": CLAUDE_THINKING_BUDGET}},
     "claude-sonnet-4-6-think": {"thinking": {"type": "enabled", "budget_tokens": CLAUDE_THINKING_BUDGET}},
 }
@@ -164,16 +201,56 @@ def create_client(model: str) -> OpenAI:
         raise ValueError(f"Unknown host_key: {host_key}")
 
 
-def build_messages(body: str, condition: str) -> list[dict]:
-    """system/user メッセージを組み立てる"""
-    system_parts = [load_prompt("instruction")]
-    if condition == "ruleset":
-        ruleset_path = PROJ_ROOT / "data" / "kiyaku" / "crc_ruleset.md"
-        system_parts.append(ruleset_path.read_text().strip())
-    return [
-        {"role": "system", "content": "\n\n".join(system_parts)},
-        {"role": "user", "content": body},
-    ]
+def build_messages(body: str, condition: str) -> list[list[dict]]:
+    """system/user メッセージを組み立てる（呼び出し1回分ずつのリスト）"""
+    prompt_names, use_ruleset = CONDITION_PROMPTS[condition]
+    message_sets = []
+    for prompt_name in prompt_names:
+        system_parts = [load_prompt(prompt_name)]
+        if use_ruleset:
+            ruleset_path = PROJ_ROOT / "data" / "kiyaku" / "crc_ruleset.md"
+            system_parts.append(ruleset_path.read_text().strip())
+        message_sets.append([
+            {"role": "system", "content": "\n\n".join(system_parts)},
+            {"role": "user", "content": body},
+        ])
+    return message_sets
+
+
+def estimate_message_tokens(message_sets: list[list[dict]]) -> tuple[int, int]:
+    """(system, user) の推定トークン数。複数呼び出しは合算"""
+    system_tokens = sum(estimate_tokens(m[0]["content"]) for m in message_sets)
+    user_tokens = sum(estimate_tokens(m[1]["content"]) for m in message_sets)
+    return system_tokens, user_tokens
+
+
+def is_no_problem(answer: str) -> bool:
+    return answer.strip().rstrip("。") == "問題なし"
+
+
+def merge_results(results: list[dict]) -> dict:
+    """複数呼び出しの結果を1件分にまとめる。tokens/duration は合算。
+    「問題なし」は全呼び出しが問題なしのときだけ残す"""
+    if len(results) == 1:
+        return results[0]
+    answers = [r["answer"] for r in results if r["answer"]]
+    findings = [a for a in answers if not is_no_problem(a)]
+    if findings:
+        answer = "\n".join(findings)
+    elif answers:
+        answer = "問題なし"
+    else:
+        answer = ""
+    finish_reasons = [r["finish_reason"] for r in results]
+    thinking = [r["thinking_tokens"] for r in results if r["thinking_tokens"]]
+    return {
+        "answer": answer,
+        "finish_reason": "length" if "length" in finish_reasons else finish_reasons[-1],
+        "prompt_tokens": sum(r["prompt_tokens"] for r in results),
+        "completion_tokens": sum(r["completion_tokens"] for r in results),
+        "thinking_tokens": sum(thinking) if thinking else None,
+        "duration_s": round(sum(r["duration_s"] for r in results), 2),
+    }
 
 
 def call_llm(client: OpenAI, model: str, messages: list[dict], temperature: float) -> dict:
@@ -246,8 +323,8 @@ def run_one(client: OpenAI, report_path: Path, model: str, condition: str,
 
     body = load_report_body(report_path)
     gold = load_gold_standard(report_path)
-    messages = build_messages(body, condition)
-    result = call_llm(client, model, messages, temperature)
+    message_sets = build_messages(body, condition)
+    result = merge_results([call_llm(client, model, m, temperature) for m in message_sets])
 
     answer = result["answer"]
     meta_header = (
@@ -373,7 +450,8 @@ class CLI(AutoCLI):
     class SingleArgs(BaseModel):
         report: str = param(..., s="-r", l="--report", description="レポートID (例: 0001) またはファイルパス")
         model: str = param("gpt-oss-20b", s="-m", l="--model")
-        ruleset: bool = param(False, l="--ruleset", description="ルールセット(kiyaku_crc)を含める")
+        ruleset: bool = param(False, l="--ruleset", description="ルールセット(kiyaku_crc)を含める (= -c ruleset)")
+        condition: str = param("", s="-c", l="--condition", description="zeroshot | ruleset | fast | fast2 (未指定なら --ruleset で決定)")
         outdir: str = param("out/results", s="-o", l="--outdir")
         temperature: float = param(0.3, s="-t", l="--temperature")
         force: bool = param(False, l="--force", description="既存結果を上書き")
@@ -381,12 +459,19 @@ class CLI(AutoCLI):
     def run_single(self, a: SingleArgs):
         report_path = resolve_report(a.report)
         report_id = report_path.stem
-        condition = "ruleset" if a.ruleset else "zeroshot"
+        if a.condition:
+            if a.condition not in CONDITION_PROMPTS:
+                print(f"Unknown condition: {a.condition} (available: {', '.join(ALL_CONDITIONS)})", file=sys.stderr)
+                return False
+            condition = a.condition
+            if a.ruleset and condition != "ruleset":
+                print(f"--ruleset と -c {condition} は同時に指定できない", file=sys.stderr)
+                return False
+        else:
+            condition = "ruleset" if a.ruleset else "zeroshot"
 
         body = load_report_body(report_path)
-        messages = build_messages(body, condition)
-        system_tokens = estimate_tokens(messages[0]["content"])
-        user_tokens = estimate_tokens(messages[1]["content"])
+        system_tokens, user_tokens = estimate_message_tokens(build_messages(body, condition))
 
         print(f"Report: {report_id}")
         print(f"Model: {a.model}")
@@ -417,7 +502,7 @@ class CLI(AutoCLI):
 
     class BatchArgs(BaseModel):
         model: str = param("all", s="-m", l="--model", description="モデル名 or 'all'")
-        condition: str = param("all", s="-c", l="--condition", description="zeroshot | ruleset | all")
+        condition: str = param("all", s="-c", l="--condition", description="zeroshot | ruleset | fast | fast2 | all (all = zeroshot+ruleset)")
         dir: str = param("data/reports", s="-d", l="--dir")
         outdir: str = param("out/results", s="-o", l="--outdir")
         temperature: float = param(0.3, s="-t", l="--temperature")
@@ -426,7 +511,7 @@ class CLI(AutoCLI):
 
     def run_batch(self, a: BatchArgs):
         models = list(MODELS.keys()) if a.model == "all" else [a.model]
-        conditions = CONDITIONS if a.condition == "all" else [a.condition]
+        conditions = resolve_conditions(a.condition)
 
         # レポートファイル一覧
         report_dir = Path(a.dir)
@@ -439,10 +524,10 @@ class CLI(AutoCLI):
         if a.dry_run:
             sample_body = load_report_body(report_files[0])
             for cond in conditions:
-                msgs = build_messages(sample_body, cond)
-                sys_tokens = estimate_tokens(msgs[0]["content"])
-                user_tokens = estimate_tokens(msgs[1]["content"])
-                print(f"[{cond}] system ~{sys_tokens} tokens, user ~{user_tokens} tokens (sample: {report_files[0].stem})")
+                msg_sets = build_messages(sample_body, cond)
+                sys_tokens, user_tokens = estimate_message_tokens(msg_sets)
+                calls = f", {len(msg_sets)} calls/report" if len(msg_sets) > 1 else ""
+                print(f"[{cond}] system ~{sys_tokens} tokens, user ~{user_tokens} tokens{calls} (sample: {report_files[0].stem})")
             for m in models:
                 for cond in conditions:
                     out_dir = Path(a.outdir) / cond / m
@@ -543,7 +628,7 @@ class CLI(AutoCLI):
 
     class ScoreArgs(BaseModel):
         model: str = param("all", s="-m", l="--model", description="モデル名 or 'all'")
-        condition: str = param("all", s="-c", l="--condition", description="zeroshot | ruleset | all")
+        condition: str = param("all", s="-c", l="--condition", description="zeroshot | ruleset | fast | fast2 | all (all = zeroshot+ruleset)")
         resultdir: str = param("out/results", s="-d", l="--resultdir")
         case: str = param("", s="-k", l="--case", description="特定の症例ID (例: 0001)")
         dry_run: bool = param(False, l="--dry-run", description="対象ファイル一覧を表示するだけ")
@@ -554,15 +639,8 @@ class CLI(AutoCLI):
         import re
         import subprocess
 
-        scoring_models = [
-            "claude-opus-4-6", "claude-opus-4-6-think",
-            "claude-sonnet-4-6", "claude-sonnet-4-6-think",
-            "deepseek-v3.2", "deepseek-v3.2-nothink",
-            "kimi-k2.6", "kimi-k2.6-nothink", "glm-5.1", "glm-5.1-nothink",
-            "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
-        ]
-        models = scoring_models if a.model == "all" else [a.model]
-        conditions = CONDITIONS if a.condition == "all" else [a.condition]
+        models = SCORING_MODELS if a.model == "all" else [a.model]
+        conditions = resolve_conditions(a.condition)
 
         prompt_text = load_prompt("scoring")
 
@@ -676,15 +754,8 @@ class CLI(AutoCLI):
         """採点の進捗を表示"""
         import re
 
-        scoring_models = [
-            "claude-opus-4-6", "claude-opus-4-6-think",
-            "claude-sonnet-4-6", "claude-sonnet-4-6-think",
-            "deepseek-v3.2", "deepseek-v3.2-nothink",
-            "kimi-k2.6", "kimi-k2.6-nothink", "glm-5.1", "glm-5.1-nothink",
-            "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
-        ]
-        for cond in CONDITIONS:
-            for model in scoring_models:
+        for cond in ALL_CONDITIONS:
+            for model in SCORING_MODELS:
                 model_dir = Path(a.resultdir) / cond / model
                 if not model_dir.exists():
                     continue
@@ -701,7 +772,7 @@ class CLI(AutoCLI):
         resultdir: str = param("out/results", s="-d", l="--resultdir")
         reportdir: str = param("data/reports", s="-r", l="--reportdir")
         model: str = param("all", s="-m", l="--model", description="モデル名 or 'all'")
-        condition: str = param("all", s="-c", l="--condition", description="zeroshot | ruleset | all")
+        condition: str = param("all", s="-c", l="--condition", description="zeroshot | ruleset | fast | fast2 | all (all = zeroshot+ruleset)")
         by_tag: bool = param(False, l="--by-tag", description="GSタグ別の内訳を表示")
         csv: str = param("", l="--csv", description="CSV出力先パス")
         outdir: str = param("", s="-o", l="--outdir", description="per-case CSV等の出力先 (例: out)")
@@ -710,15 +781,8 @@ class CLI(AutoCLI):
         """スコアを集計して表示"""
         import re
 
-        scoring_models = [
-            "claude-opus-4-6", "claude-opus-4-6-think",
-            "claude-sonnet-4-6", "claude-sonnet-4-6-think",
-            "deepseek-v3.2", "deepseek-v3.2-nothink",
-            "kimi-k2.6", "kimi-k2.6-nothink", "glm-5.1", "glm-5.1-nothink",
-            "gpt-oss-120b", "gpt-oss-20b", "sip-jmed-13b",
-        ]
-        models = scoring_models if a.model == "all" else [a.model]
-        conditions = CONDITIONS if a.condition == "all" else [a.condition]
+        models = SCORING_MODELS if a.model == "all" else [a.model]
+        conditions = resolve_conditions(a.condition)
 
         # GSタグをレポートファイルから取得
         gs_tags = {}
