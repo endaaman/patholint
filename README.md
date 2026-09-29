@@ -14,9 +14,22 @@ uv sync
 
 ```bash
 uv run cli --help           # コマンド一覧
-uv run cli models           # 利用可能なモデル一覧
-uv run cli test -m gpt-oss-20b  # 疎通テスト
+uv run cli models           # 利用可能なモデル一覧（実モデル名・サンプリング・思考上限つき）
+uv run cli test -m gpt-oss-20b  # 疎通テスト（本番と同じ実モデル名・extra_body・サンプリングで送る）
 ```
+
+モデル設定は `patholint/cli.py` の `MODELS`（エイリアス → `ModelSpec`）に集約している:
+送信先・実モデル名（`upstream`）・`extra_body`・サンプリング・`max_tokens`・思考長上限・サンプル数。
+
+`-t/--temperature` の扱いはモデルのサンプリング指定で決まる（`cli models` に表示）:
+
+| sampling | 該当 | `-t` 未指定 | `-t` 明示 |
+|---|---|---|---|
+| `-t (default 0.3)` | 既存の API モデル全般 | temperature 0.3 | その値 |
+| `server default` | `qwen3.8-27b` / `-nothink` | 何も送らない（SGLang の generation_config: 1.0 / 0.95 / top_k 20） | temperature だけ送る |
+| 固定値 | Claude `-think`（1.0）、Qwen3.8 思考派生（推奨値） | 固定値 | 無視 |
+
+`qwen3.8-27b` / `-nothink` は 2026-09-30 まで temperature 0.3 を送っていた（既存の結果はこの条件）。
 
 #### バリデーション実行
 
@@ -76,6 +89,7 @@ Qwen3.8-27B の thinking は上限なしだと 5k–16k+ tok 続き（10 分近�
 単発（並列なし）の所要時間は t1k ~32s、t2k ~58s。
 
 - サンプリングは Qwen 推奨値（temperature 0.6 / top_p 0.95 / top_k 20）固定。`-t` は効かない
+- presence_penalty（Qwen 推奨 1.5）は付けていない。現行の sglang-qwen38（DFLASH）は penalty 系を無視するため
 - 1回目を `max_tokens=budget` で生成し、思考が上限で切れたら（または思考中に終了したら）思考を閉じた
   assistant prefill（`continue_final_message`）で回答だけを生成させる。サーバ側の設定には依存しない
   （このとき meta に `forced_answer: true` が付く。実測では t1k–t4k のほぼ全件がこの経路）

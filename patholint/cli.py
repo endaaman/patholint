@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -21,36 +22,160 @@ load_dotenv()
 
 PROJ_ROOT = Path(__file__).resolve().parent.parent
 
-MODELS = {
-    # model_name: (host, port, description)
-    "claude-opus-4-6":         ("litellm", None, "Claude Opus 4.6"),
-    "claude-opus-4-6-think":   ("litellm", None, "Claude Opus 4.6 (extended thinking)"),
-    "claude-sonnet-4-6":       ("litellm", None, "Claude Sonnet 4.6"),
-    "claude-sonnet-4-6-think": ("litellm", None, "Claude Sonnet 4.6 (extended thinking)"),
-    "deepseek-v3.2":         ("dedicated", 8000, "DeepSeek V3.2"),
-    "deepseek-v3.2-nothink": ("dedicated", 8000, "DeepSeek V3.2 (no think)"),
-    "kimi-k2.6":             ("dedicated", 8000, "Kimi K2.6"),
-    "kimi-k2.6-nothink":     ("dedicated", 8000, "Kimi K2.6 (no think)"),
-    "glm-5.1":               ("dedicated", 8000, "GLM-5.1 FP8"),
-    "glm-5.1-nothink":       ("dedicated", 8000, "GLM-5.1 FP8 (no think)"),
-    "gpt-oss-20b":        ("litellm", None, "GPT-OSS 20B"),
-    "gpt-oss-120b":       ("litellm", None, "GPT-OSS 120B"),
-    "sip-jmed-13b":       ("litellm", None, "SIP-JMed 13B"),
-    "sip-jmed-8x13b-q8":  ("litellm", None, "SIP-JMed 8x13B Q8"),
-    "nemotron-3-nano":    ("litellm", None, "Nemotron-3 Nano"),
-    "nemotron-3-super":   ("litellm", None, "Nemotron-3 Super"),
-    "qwen3.5-9b":         ("litellm", None, "Qwen 3.5 9B"),
-    "qwen3.5-27b":        ("litellm", None, "Qwen 3.5 27B"),
-    # enda-spark ローカル (prism-gw :4000 → SGLang + DFlash2)。prism-hu/chat の sglang-qwen38
-    "qwen3.8-27b":         ("litellm", None, "Qwen3.8 27B (SGLang, Spark)"),
-    "qwen3.8-27b-nothink": ("litellm", None, "Qwen3.8 27B (SGLang, Spark, no think)"),
-    # thinking ON を推奨サンプリング + 思考長上限つきで回す派生（下の QWEN38_VARIANTS）
-    "qwen3.8-27b-think":   ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think, 推奨サンプリング, 上限なし)"),
-    "qwen3.8-27b-t1k":     ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think budget 1k)"),
-    "qwen3.8-27b-t2k":     ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think budget 2k)"),
-    "qwen3.8-27b-t4k":     ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think budget 4k)"),
-    "qwen3.8-27b-t1kx2":   ("litellm", None, "Qwen3.8 27B (SGLang, Spark, think budget 1k x 2 samples, union)"),
+# ---- モデル定義 ----
+# エイリアスごとの設定はすべて ModelSpec にまとめる（送信先・実モデル名・extra_body・サンプリング・
+# max_tokens・思考長上限・サンプル数）。リクエストの組み立ては request_kwargs() に集約。
+
+# nothink はループに陥りがちなので低めに、thinking 用は思考分の余裕を残す
+DEFAULT_MAX_TOKENS = 65536
+NOTHINK_MAX_TOKENS = 8192
+# 思考を閉じた後の回答分（思考上限つき派生の2回目の呼び出しの max_tokens）
+BUDGET_ANSWER_TOKENS = 4096
+
+# サンプリングの指定（ModelSpec.sampling）
+# - SAMPLING_CLI: -t/--temperature を temperature として送る。未指定なら LEGACY_TEMPERATURE（0.3）。
+#   既存モデルはこれ（過去の結果と条件を揃えるため）
+# - None: 何も送らずサーバ既定に任せる（SGLang は generation_config 由来の値）。
+#   -t を明示したときだけ temperature を送る
+# - dict: 固定値。-t は無視する。temperature / top_p / presence_penalty / frequency_penalty は
+#   OpenAI の引数、それ以外（top_k など）は extra_body で送る
+SAMPLING_CLI = "cli"
+LEGACY_TEMPERATURE = 0.3
+OPENAI_SAMPLING_KEYS = {"temperature", "top_p", "presence_penalty", "frequency_penalty"}
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    description: str
+    upstream: str                           # 実際に送るモデル名
+    host: str = "litellm"                   # litellm (prism-gw :4000) | dedicated
+    port: int | None = None
+    extra_body: dict = field(default_factory=dict)
+    sampling: dict | str | None = SAMPLING_CLI
+    max_tokens: int = DEFAULT_MAX_TOKENS    # 1回目の呼び出しの max_tokens
+    # 思考長の上限（クライアント側）。1回目を max_tokens=think_budget で生成し、length で切れたら
+    # 思考を閉じた assistant prefill（continue_final_message）で回答だけを生成させる
+    think_budget: int | None = None
+    # 思考が上限で切れた / 思考中に終了して content が空のとき、prefill で回答を出させる
+    force_answer: bool = False
+    # 独立に N 回サンプルし（並列）、指摘の和集合を回答にする
+    samples: int = 1
+
+
+# Claude の extended thinking は litellm 経由で extra_body.thinking で指定。
+# Anthropic API 仕様で temperature=1.0 強制、max_tokens > budget_tokens 必須。
+CLAUDE_THINKING_BUDGET = 8000
+CLAUDE_THINK = dict(
+    extra_body={"thinking": {"type": "enabled", "budget_tokens": CLAUDE_THINKING_BUDGET}},
+    sampling={"temperature": 1.0},
+)
+# vLLM/SGLang 系の chat template の thinking 切替。
+# Kimi-K2.6 の chat_template.jinja は `thinking` キーを参照
+# （`thinking is false` で <think></think> 空タグを挿入して reasoning を抑止）
+DEDICATED = dict(host="dedicated", port=8000)
+
+# Qwen3.8-27B（enda-spark ローカル。prism-gw :4000 → prism-hu/chat の sglang-qwen38, SGLang + DFlash2）
+# plain / nothink はサーバ既定のサンプリング（sampling_defaults=model → generation_config の
+# temperature 1.0 / top_p 0.95 / top_k 20）。以前は CLI 既定の temperature 0.3 を送っていた
+# （2026-09-30 まで。これが思考暴走の一因）。
+# thinking 派生は Qwen 推奨サンプリング固定 + 思考長上限。サンプリングを直しても思考は
+# 5k–16k+ tok 続き、content 空で終わることもあるので、上限をクライアント側で掛ける
+QWEN38 = "qwen3.8-27b"
+QWEN38_NOTHINK = {"chat_template_kwargs": {"enable_thinking": False}}
+QWEN38_SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+# Qwen 推奨の presence_penalty 1.5 は入れていない。現行の sglang-qwen38（DFLASH v2 + overlap schedule）は
+# penalty 系を投機デコード中に落とすので送っても効かない（2026-09-30 確認）
+
+
+def qwen38_think(description: str, budget: int | None, samples: int = 1,
+                 sampling: dict = QWEN38_SAMPLING) -> ModelSpec:
+    return ModelSpec(
+        description, QWEN38, sampling=sampling,
+        max_tokens=budget or DEFAULT_MAX_TOKENS, think_budget=budget,
+        force_answer=True, samples=samples,
+    )
+
+
+MODELS: dict[str, ModelSpec] = {
+    "claude-opus-4-6":         ModelSpec("Claude Opus 4.6", "claude-opus-4-6"),
+    "claude-opus-4-6-think":   ModelSpec("Claude Opus 4.6 (extended thinking)", "claude-opus-4-6", **CLAUDE_THINK),
+    "claude-sonnet-4-6":       ModelSpec("Claude Sonnet 4.6", "claude-sonnet-4-6"),
+    "claude-sonnet-4-6-think": ModelSpec("Claude Sonnet 4.6 (extended thinking)", "claude-sonnet-4-6", **CLAUDE_THINK),
+    "deepseek-v3.2":         ModelSpec("DeepSeek V3.2", "deepseek-v3.2", **DEDICATED,
+                                       extra_body={"chat_template_kwargs": {"thinking": True}}),
+    "deepseek-v3.2-nothink": ModelSpec("DeepSeek V3.2 (no think)", "deepseek-v3.2", **DEDICATED,
+                                       max_tokens=NOTHINK_MAX_TOKENS),
+    "kimi-k2.6":             ModelSpec("Kimi K2.6", "kimi-k2.6", **DEDICATED),
+    "kimi-k2.6-nothink":     ModelSpec("Kimi K2.6 (no think)", "kimi-k2.6", **DEDICATED,
+                                       extra_body={"chat_template_kwargs": {"thinking": False}},
+                                       max_tokens=NOTHINK_MAX_TOKENS),
+    "glm-5.1":               ModelSpec("GLM-5.1 FP8", "glm-5.1", **DEDICATED),
+    "glm-5.1-nothink":       ModelSpec("GLM-5.1 FP8 (no think)", "glm-5.1", **DEDICATED,
+                                       extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                                       max_tokens=NOTHINK_MAX_TOKENS),
+    "gpt-oss-20b":        ModelSpec("GPT-OSS 20B", "gpt-oss-20b"),
+    "gpt-oss-120b":       ModelSpec("GPT-OSS 120B", "gpt-oss-120b"),
+    "sip-jmed-13b":       ModelSpec("SIP-JMed 13B", "sip-jmed-13b"),
+    "sip-jmed-8x13b-q8":  ModelSpec("SIP-JMed 8x13B Q8", "sip-jmed-8x13b-q8"),
+    "nemotron-3-nano":    ModelSpec("Nemotron-3 Nano", "nemotron-3-nano"),
+    "nemotron-3-super":   ModelSpec("Nemotron-3 Super", "nemotron-3-super"),
+    "qwen3.5-9b":         ModelSpec("Qwen 3.5 9B", "qwen3.5-9b"),
+    "qwen3.5-27b":        ModelSpec("Qwen 3.5 27B", "qwen3.5-27b"),
+    "qwen3.8-27b":         ModelSpec("Qwen3.8 27B (SGLang, Spark)", QWEN38, sampling=None),
+    "qwen3.8-27b-nothink": ModelSpec("Qwen3.8 27B (SGLang, Spark, no think)", QWEN38, sampling=None,
+                                     extra_body=QWEN38_NOTHINK, max_tokens=NOTHINK_MAX_TOKENS),
+    "qwen3.8-27b-think":   qwen38_think("Qwen3.8 27B (SGLang, Spark, think, 推奨サンプリング, 上限なし)", None),
+    "qwen3.8-27b-t1k":     qwen38_think("Qwen3.8 27B (SGLang, Spark, think budget 1k)", 1024),
+    "qwen3.8-27b-t2k":     qwen38_think("Qwen3.8 27B (SGLang, Spark, think budget 2k)", 2048),
+    "qwen3.8-27b-t4k":     qwen38_think("Qwen3.8 27B (SGLang, Spark, think budget 4k)", 4096),
+    "qwen3.8-27b-t1kx2":   qwen38_think("Qwen3.8 27B (SGLang, Spark, think budget 1k x 2 samples, union)", 1024, samples=2),
 }
+
+
+def get_spec(model: str) -> ModelSpec:
+    spec = MODELS.get(model)
+    if spec is None:
+        raise ValueError(f"Unknown model: {model} (available: {', '.join(MODELS.keys())})")
+    return spec
+
+
+def resolve_sampling(spec: ModelSpec, temperature: float) -> dict:
+    """送るサンプリング引数（top_k 等も含むフラットな dict）。temperature < 0 は -t 未指定"""
+    if spec.sampling == SAMPLING_CLI:
+        return {"temperature": temperature if temperature >= 0 else LEGACY_TEMPERATURE}
+    if spec.sampling is None:
+        return {"temperature": temperature} if temperature >= 0 else {}
+    return dict(spec.sampling)
+
+
+def describe_sampling(spec: ModelSpec) -> str:
+    if spec.sampling == SAMPLING_CLI:
+        return f"-t (default {LEGACY_TEMPERATURE})"
+    if spec.sampling is None:
+        return "server default"
+    return " ".join(f"{k}={v}" for k, v in spec.sampling.items())
+
+
+def request_kwargs(model: str, messages: list[dict], temperature: float, stream: bool = True) -> dict:
+    """1回目の呼び出しの chat.completions.create 引数"""
+    spec = get_spec(model)
+    kwargs = {
+        "model": spec.upstream,
+        "messages": messages,
+        "max_tokens": spec.max_tokens,
+    }
+    if stream:
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+    extra_body = dict(spec.extra_body)
+    for k, v in resolve_sampling(spec, temperature).items():
+        if k in OPENAI_SAMPLING_KEYS:
+            kwargs[k] = v
+        else:
+            extra_body[k] = v
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+    return kwargs
 
 # `-c all` で回す条件（ruleset 有無の比較実験）。fast は別系統なので明示指定のみ
 CONDITIONS = ["zeroshot", "ruleset"]
@@ -86,72 +211,7 @@ SCORING_MODELS = [
     "qwen3.8-27b", "qwen3.8-27b-nothink",
     "qwen3.8-27b-think", "qwen3.8-27b-t1k", "qwen3.8-27b-t2k", "qwen3.8-27b-t4k", "qwen3.8-27b-t1kx2",
 ]
-
-# vLLM/SGLang 系で chat template の thinking 切替に渡す extra_body
-# Kimi-K2.6 の chat_template.jinja は `thinking` キーを参照
-# （`thinking is false` で <think></think> 空タグを挿入して reasoning を抑止）
-# Claude の extended thinking は litellm 経由で extra_body.thinking で指定。
-# Anthropic API 仕様で temperature=1.0 強制、max_tokens > budget_tokens 必須。
-CLAUDE_THINKING_BUDGET = 8000
-MODEL_EXTRA_BODY = {
-    "deepseek-v3.2":     {"chat_template_kwargs": {"thinking": True}},
-    "kimi-k2.6-nothink": {"chat_template_kwargs": {"thinking": False}},
-    "glm-5.1-nothink":   {"chat_template_kwargs": {"enable_thinking": False}},
-    # SGLang (--reasoning-parser qwen3)。prism-gw は extra_body を素通しする
-    "qwen3.8-27b-nothink": {"chat_template_kwargs": {"enable_thinking": False}},
-    "claude-opus-4-6-think":   {"thinking": {"type": "enabled", "budget_tokens": CLAUDE_THINKING_BUDGET}},
-    "claude-sonnet-4-6-think": {"thinking": {"type": "enabled", "budget_tokens": CLAUDE_THINKING_BUDGET}},
-}
-
-# nothink はループに陥りがちなので低めに、thinking 用は思考分の余裕を残す
-DEFAULT_MAX_TOKENS = 65536
-NOTHINK_MAX_TOKENS = 8192
-
-# Qwen3.8-27B thinking ON の派生。alias: thinking budget（None = 上限なし）
-# - サンプリングは Qwen 推奨値。CLI の --temperature より優先する
-#   （ただしサンプリングを直しても思考は 5k–16k+ tok 続き、content 空で終わることもある）
-# - budget はクライアント側で掛ける: 1回目を max_tokens=budget で生成し、length で切れたら
-#   思考を閉じた assistant prefill（continue_final_message）で回答だけを生成させる。
-#   サーバ側の設定（--enable-strict-thinking 等）には依存しない
-QWEN38_SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
-QWEN38_VARIANTS = {
-    "qwen3.8-27b-think": None,
-    "qwen3.8-27b-t1k": 1024,
-    "qwen3.8-27b-t2k": 2048,
-    "qwen3.8-27b-t4k": 4096,
-    "qwen3.8-27b-t1kx2": 1024,
-}
-# 同じ条件で独立に N 回サンプルし（並列）、指摘の和集合を回答にする派生。
-# 1 サンプルごとの見逃しがばらつくので、和集合で recall を稼ぐ（FP も増える）
-QWEN38_SAMPLES = {
-    "qwen3.8-27b-t1kx2": 2,
-}
-# 思考を閉じた後の回答分（2回目の呼び出しの max_tokens）
-BUDGET_ANSWER_TOKENS = 4096
-
-
-def get_max_tokens(model: str) -> int:
-    if model.endswith("-nothink"):
-        return NOTHINK_MAX_TOKENS
-    budget = QWEN38_VARIANTS.get(model)
-    if budget is not None:
-        return budget
-    return DEFAULT_MAX_TOKENS
-
-
-def get_actual_model_name(model: str) -> str:
-    """エイリアス（-nothink/-think 等）を実モデル名に解決して送信する"""
-    if model in QWEN38_VARIANTS:
-        return "qwen3.8-27b"
-    for suffix in ("-nothink", "-think"):
-        if model.endswith(suffix):
-            return model[: -len(suffix)]
-    return model
-
-
-def needs_temp_one(model: str) -> bool:
-    """Claude extended thinking は temperature=1.0 必須"""
-    return model.endswith("-think") and model.startswith("claude-")
+assert all(m in MODELS for m in SCORING_MODELS)
 
 
 def serialize_value(val):
@@ -214,10 +274,8 @@ def estimate_tokens(text: str) -> int:
 
 def create_client(model: str) -> OpenAI:
     """モデル名に応じたOpenAI clientを作成。"""
-    info = MODELS.get(model)
-    if not info:
-        raise ValueError(f"Unknown model: {model} (available: {', '.join(MODELS.keys())})")
-    host_key, port, _ = info
+    spec = get_spec(model)
+    host_key, port = spec.host, spec.port
     if host_key == "litellm":
         host = os.environ.get("LITELLM_HOST", "prism-spark")
         key = os.environ.get("LITELLM_MASTER_KEY", "")
@@ -342,23 +400,9 @@ def _answer_prefill(reasoning: str, content: str, truncated: bool) -> str:
 def _call_llm_once(client: OpenAI, model: str, messages: list[dict], temperature: float) -> dict:
     """LLM呼び出しを1回実行し、結果を辞書で返す（streaming）"""
     t0 = time.time()
-    kwargs = {
-        "model": get_actual_model_name(model),
-        "messages": messages,
-        "temperature": 1.0 if needs_temp_one(model) else temperature,
-        "max_tokens": get_max_tokens(model),
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
-    extra_body = dict(MODEL_EXTRA_BODY.get(model) or {})
-    is_qwen38_variant = model in QWEN38_VARIANTS
-    budget = QWEN38_VARIANTS.get(model)
-    if is_qwen38_variant:
-        kwargs["temperature"] = QWEN38_SAMPLING["temperature"]
-        kwargs["top_p"] = QWEN38_SAMPLING["top_p"]
-        extra_body["top_k"] = QWEN38_SAMPLING["top_k"]
-    if extra_body:
-        kwargs["extra_body"] = extra_body
+    spec = get_spec(model)
+    kwargs = request_kwargs(model, messages, temperature)
+    extra_body = kwargs.get("extra_body", {})
 
     r = _stream_chat(client, kwargs)
     prompt_tokens, completion_tokens, thinking_tokens = _usage_tokens(r["usage"])
@@ -366,10 +410,10 @@ def _call_llm_once(client: OpenAI, model: str, messages: list[dict], temperature
     answer = r["content"]
     forced = False
 
-    # thinking 派生: budget で切れた、または思考中に終了して content が空なら、
+    # force_answer: 思考上限で切れた、または思考中に終了して content が空なら、
     # 思考を閉じた assistant prefill で回答（の続き）を生成させる
-    truncated = budget is not None and finish_reason == "length"
-    if is_qwen38_variant and r["reasoning"] and (truncated or not answer):
+    truncated = spec.think_budget is not None and finish_reason == "length"
+    if spec.force_answer and r["reasoning"] and (truncated or not answer):
         kwargs2 = dict(kwargs)
         kwargs2["messages"] = messages + [
             {"role": "assistant", "content": _answer_prefill(r["reasoning"], answer, truncated)}
@@ -425,8 +469,8 @@ def union_answers(answers: list[str]) -> str:
 
 
 def call_llm(client: OpenAI, model: str, messages: list[dict], temperature: float) -> dict:
-    """LLM呼び出しを実行し、結果を辞書で返す。QWEN38_SAMPLES の派生は N 並列サンプルの和集合"""
-    n = QWEN38_SAMPLES.get(model, 1)
+    """LLM呼び出しを実行し、結果を辞書で返す。samples > 1 のモデルは N 並列サンプルの和集合"""
+    n = get_spec(model).samples
     if n <= 1:
         return _call_llm_once(client, model, messages, temperature)
     t0 = time.time()
@@ -600,7 +644,7 @@ class CLI(AutoCLI):
         ruleset: bool = param(False, l="--ruleset", description="ルールセット(kiyaku_crc)を含める (= -c ruleset)")
         condition: str = param("", s="-c", l="--condition", description="zeroshot | ruleset | fast | fast2 (未指定なら --ruleset で決定)")
         outdir: str = param("out/results", s="-o", l="--outdir")
-        temperature: float = param(0.3, s="-t", l="--temperature")
+        temperature: float = param(-1.0, s="-t", l="--temperature", description="未指定(-1)はモデル既定: 既存モデルは 0.3、サーバ既定のモデルは送らない、固定サンプリングのモデルでは無視")
         force: bool = param(False, l="--force", description="既存結果を上書き")
 
     def run_single(self, a: SingleArgs):
@@ -652,7 +696,7 @@ class CLI(AutoCLI):
         condition: str = param("all", s="-c", l="--condition", description="zeroshot | ruleset | fast | fast2 | all (all = zeroshot+ruleset)")
         dir: str = param("data/reports", s="-d", l="--dir")
         outdir: str = param("out/results", s="-o", l="--outdir")
-        temperature: float = param(0.3, s="-t", l="--temperature")
+        temperature: float = param(-1.0, s="-t", l="--temperature", description="未指定(-1)はモデル既定: 既存モデルは 0.3、サーバ既定のモデルは送らない、固定サンプリングのモデルでは無視")
         force: bool = param(False, l="--force", description="既存結果を上書き")
         dry_run: bool = param(False, l="--dry-run", description="API呼び出しせず件数とプロンプトサイズを表示")
         parallel: int = param(1, s="-p", l="--parallel", description="同時リクエスト数（SGLang 等の連続バッチング向け）")
@@ -753,24 +797,24 @@ class CLI(AutoCLI):
 
     class TestArgs(BaseModel):
         model: str = param("gpt-oss-20b", s="-m", l="--model")
+        max_tokens: int = param(32, s="-n", l="--max-tokens", description="回答分の max_tokens（Claude think は budget_tokens に上乗せ）")
         verbose: bool = param(False, s="-v", l="--verbose", description="生レスポンスを表示")
 
     def run_test(self, a: TestArgs):
-        """疎通テスト"""
-        info = MODELS.get(a.model)
-        host_desc = f"{info[0]}:{info[1]}" if info else "unknown"
-        print(f"Host: {host_desc}")
+        """疎通テスト（本番と同じ実モデル名・extra_body・サンプリングで送る）"""
+        spec = get_spec(a.model)
+        print(f"Host: {spec.host}:{spec.port}" if spec.port else f"Host: {spec.host}")
         client = create_client(a.model)
-        print(f"Model: {a.model}")
+        print(f"Model: {a.model} (upstream: {spec.upstream}, sampling: {describe_sampling(spec)})")
         print(f"Sending test message...", flush=True)
 
+        kwargs = request_kwargs(a.model, [{"role": "user", "content": "Hello, respond with OK."}], -1.0, stream=False)
+        # Anthropic API は max_tokens > budget_tokens 必須
+        budget = kwargs.get("extra_body", {}).get("thinking", {}).get("budget_tokens", 0)
+        kwargs["max_tokens"] = budget + a.max_tokens
         try:
             t0 = time.time()
-            res = client.chat.completions.create(
-                model=a.model,
-                messages=[{"role": "user", "content": "Hello, respond with OK."}],
-                max_tokens=32,
-            )
+            res = client.chat.completions.create(**kwargs)
             duration = time.time() - t0
         except Exception as e:
             print(f"ERROR: {e}")
@@ -778,6 +822,7 @@ class CLI(AutoCLI):
 
         choice = res.choices[0]
         content = choice.message.content or ""
+        reasoning = getattr(choice.message, "reasoning_content", None) or ""
         usage = res.usage
 
         if a.verbose:
@@ -786,19 +831,27 @@ class CLI(AutoCLI):
             print(f"--- End ---\n")
 
         print(f"Content: {content.strip()!r}")
+        if reasoning:
+            print(f"Reasoning: {len(reasoning)} chars")
         print(f"Finish reason: {choice.finish_reason}")
         print(f"Tokens: prompt={usage.prompt_tokens}, completion={usage.completion_tokens}" if usage else "Tokens: N/A")
         print(f"Duration: {duration:.1f}s")
-        print(f"OK" if content.strip() else "WARNING: empty response")
+        print(f"OK" if content.strip() else "WARNING: empty response (thinking モデルなら -n を増やす)")
 
     class ModelsArgs(BaseModel):
         pass
 
     def run_models(self, a: ModelsArgs):
         print("Available models:")
-        for name, (host, port, desc) in MODELS.items():
-            loc = f"{host}:{port}" if port else host
-            print(f"  {name:25s} {loc:20s} {desc}")
+        for name, spec in MODELS.items():
+            loc = f"{spec.host}:{spec.port}" if spec.port else spec.host
+            extras = [f"sampling: {describe_sampling(spec)}"]
+            if spec.think_budget:
+                extras.append(f"think budget {spec.think_budget}")
+            if spec.samples > 1:
+                extras.append(f"x{spec.samples} union")
+            print(f"  {name:25s} {loc:15s} {spec.description}")
+            print(f"  {'':25s} {'':15s} -> {spec.upstream}, max_tokens {spec.max_tokens}, {', '.join(extras)}")
 
 
     class ScoreArgs(BaseModel):
